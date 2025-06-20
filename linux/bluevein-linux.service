@@ -1,0 +1,12 @@
+[Unit]
+Description=Bluetooth Dual Boot Sync Daemon
+After=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bluevein-linux
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

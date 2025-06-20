@@ -1,0 +1,15 @@
+[package]
+name = "bluevein-linux"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "bluevein-linux"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+dbus = "0.9.7"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"

@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "linux",
+    "windows",
+    "shared",
+]
+resolver = "2"
+
