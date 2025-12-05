@@ -1,0 +1,43 @@
+[package]
+name = "bluevein"
+version = "0.1.0"
+edition = "2021"
+authors = ["meowrch"]
+description = "Bluetooth device synchronization service for dual-boot systems"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+hex = "0.4"
+fat32-raw = "1.0.1"
+ctrlc = "3.5"
+once_cell = "1.19"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-service = "0.7"
+winreg = "0.52"
+chrono = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
+]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+inotify = "0.10"
+nix = { version = "0.29", features = ["user"] }
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

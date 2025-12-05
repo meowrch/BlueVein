@@ -1,0 +1,15 @@
+[Unit]
+Description=BlueVein Bluetooth Key Sync Service
+After=bluetooth.target network.target
+Documentation=https://github.com/meowrch/BlueVein
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bluevein
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
