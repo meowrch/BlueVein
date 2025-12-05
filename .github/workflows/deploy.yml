@@ -69,6 +69,8 @@ jobs:
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: "Update bluevein-git"
           allow_empty_commits: false
+          assets: |
+            bluevein.install
 
   # Деплой стабильной версии на AUR (при релизе)
   deploy-aur-stable:
@@ -118,6 +120,8 @@ jobs:
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: "Release v${{ steps.get_version.outputs.version }}"
+          assets: |
+            bluevein.install
 
   # Деплой бинарной версии на AUR (при релизе)
   deploy-aur-bin:
@@ -174,3 +178,5 @@ jobs:
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: "Binary release v${{ steps.get_version.outputs.version }}"
+          assets: |
+            bluevein.install

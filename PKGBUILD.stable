@@ -10,6 +10,7 @@ depends=('dbus')
 makedepends=('rust' 'cargo')
 provides=('bluevein')
 conflicts=('bluevein-git' 'bluevein-bin')
+install=bluevein.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # Will be updated by CI
 

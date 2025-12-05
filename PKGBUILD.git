@@ -10,6 +10,7 @@ depends=('dbus')
 makedepends=('rust' 'cargo' 'git')
 provides=('bluevein')
 conflicts=('bluevein' 'bluevein-bin')
+install=bluevein.install
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
 
