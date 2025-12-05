@@ -70,10 +70,10 @@ jobs:
           commit_message: "Update bluevein-git"
           allow_empty_commits: false
 
-  # Деплой стабильных версий на AUR (при релизе)
+  # Деплой стабильной версии на AUR (при релизе)
   deploy-aur-stable:
     if: github.event_name == 'release'
-    needs: build-binaries  # Ждем завершения сборки бинарников
+    needs: build-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,28 +90,11 @@ jobs:
       - name: Calculate SHA256 for source tarball
         id: sha256_src
         run: |
-          URL="https://github.com/meowrch/BlueVein-new/archive/refs/tags/v${{ steps.get_version.outputs.version }}.tar.gz"
+          URL="https://github.com/meowrch/BlueVein/archive/refs/tags/v${{ steps.get_version.outputs.version }}.tar.gz"
           echo "Downloading from: $URL"
           HASH=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
           echo "Source SHA256: $HASH"
           echo "hash=$HASH" >> $GITHUB_OUTPUT
-
-      - name: Calculate SHA256 for Linux binary
-        id: sha256_bin
-        run: |
-          URL="https://github.com/meowrch/BlueVein-new/releases/download/v${{ steps.get_version.outputs.version }}/bluevein-linux-x86_64"
-          echo "Downloading from: $URL"
-          # Retry logic for binary (может загружаться дольше)
-          for i in {1..5}; do
-            HASH=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
-            if [ ! -z "$HASH" ]; then
-              echo "Binary SHA256: $HASH"
-              echo "hash=$HASH" >> $GITHUB_OUTPUT
-              break
-            fi
-            echo "Retry $i/5..."
-            sleep 10
-          done
 
       - name: Update PKGBUILD.stable
         run: |
@@ -123,6 +106,52 @@ jobs:
           echo "=== Updated PKGBUILD.stable ==="
           cat PKGBUILD.stable
 
+      - name: Prepare PKGBUILD
+        run: cp PKGBUILD.stable PKGBUILD
+
+      - name: Deploy bluevein to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3
+        with:
+          pkgname: bluevein
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Release v${{ steps.get_version.outputs.version }}"
+
+  # Деплой бинарной версии на AUR (при релизе)
+  deploy-aur-bin:
+    if: github.event_name == 'release'
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get release version
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Wait for release assets to be available
+        run: |
+          echo "Waiting for release assets to be uploaded..."
+          sleep 30
+
+      - name: Calculate SHA256 for Linux binary
+        id: sha256_bin
+        run: |
+          URL="https://github.com/meowrch/BlueVein/releases/download/v${{ steps.get_version.outputs.version }}/bluevein-linux-x86_64"
+          echo "Downloading from: $URL"
+          for i in {1..5}; do
+            HASH=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
+            if [ ! -z "$HASH" ]; then
+              echo "Binary SHA256: $HASH"
+              echo "hash=$HASH" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "Retry $i/5..."
+            sleep 10
+          done
+
       - name: Update PKGBUILD.bin
         run: |
           sed -i \
@@ -133,21 +162,14 @@ jobs:
           echo "=== Updated PKGBUILD.bin ==="
           cat PKGBUILD.bin
 
-      - name: Deploy bluevein to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v3
-        with:
-          pkgname: bluevein
-          pkgbuild: ./PKGBUILD.stable
-          commit_username: ${{ secrets.AUR_USERNAME }}
-          commit_email: ${{ secrets.AUR_EMAIL }}
-          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "Release v${{ steps.get_version.outputs.version }}"
+      - name: Prepare PKGBUILD
+        run: cp PKGBUILD.bin PKGBUILD
 
       - name: Deploy bluevein-bin to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3
         with:
           pkgname: bluevein-bin
-          pkgbuild: ./PKGBUILD.bin
+          pkgbuild: ./PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
