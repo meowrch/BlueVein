@@ -156,7 +156,7 @@ jobs:
         run: |
           sed -i \
             -e "s/^pkgver=.*/pkgver=${{ steps.get_version.outputs.version }}/" \
-            -e "s/^sha256sums=.*/sha256sums=('${{ steps.sha256_bin.outputs.hash }}')/" \
+            -e "s/^sha256sums=.*/sha256sums=('${{ steps.sha256_bin.outputs.hash }}' 'SKIP')/" \
             PKGBUILD.bin
           
           echo "=== Updated PKGBUILD.bin ==="
