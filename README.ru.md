@@ -116,6 +116,9 @@ cargo build --release
 sudo cp target/release/bluevein /usr/local/bin/
 sudo cp ./systemd/bluevein.service /etc/systemd/system/
 
+# Исправляем путь в файле службы (по умолчанию указывает на /usr/bin)
+sudo sed -i 's|/usr/bin/bluevein|/usr/local/bin/bluevein|g' /etc/systemd/system/bluevein.service
+
 # 3. Запускаем
 sudo systemctl daemon-reload
 sudo systemctl enable --now bluevein
