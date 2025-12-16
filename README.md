@@ -113,11 +113,8 @@ cd BlueVein
 cargo build --release
 
 # 2. Install
-sudo cp target/release/bluevein /usr/local/bin/
+sudo cp target/release/bluevein /usr/bin/
 sudo cp ./systemd/bluevein.service /etc/systemd/system/
-
-# Fix binary path in service file (points to /usr/bin by default)
-sudo sed -i 's|/usr/bin/bluevein|/usr/local/bin/bluevein|g' /etc/systemd/system/bluevein.service
 
 # 3. Run
 sudo systemctl daemon-reload
