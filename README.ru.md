@@ -113,7 +113,7 @@ cd BlueVein
 cargo build --release
 
 # 2. Устанавливаем
-sudo cp target/release/bluevein /usr/local/bin/
+sudo cp target/release/bluevein /usr/bin/
 sudo cp ./systemd/bluevein.service /etc/systemd/system/
 
 # 3. Запускаем
