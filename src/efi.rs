@@ -51,7 +51,7 @@ fn find_mounted_efi() -> Option<String> {
                 .output();
 
             if let Ok(output) = check_mount {
-                let fstype = String::from_utf8_lossy(&output.stdout).trim();
+                let fstype = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let efi_dir = path.join("EFI");
 
                 // Check if it's actually mounted and looks like EFI
