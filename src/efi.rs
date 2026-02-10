@@ -40,7 +40,7 @@ fn find_mounted_efi() -> Option<String> {
     {
         for mount_point in EFI_MOUNT_POINTS {
             let path = Path::new(mount_point);
-            if !path.exists() { continue; }
+            if !(path.exists() && path.is_dir()) { continue; }
 
             // findmnt for robustness, can check filesystem type
             let check_mount = Command::new("findmnt")
@@ -55,7 +55,7 @@ fn find_mounted_efi() -> Option<String> {
                 let efi_dir = path.join("EFI");
 
                 // Check if it's actually mounted and looks like EFI
-                if fstype == "vfat" && efi_dir.exists() {
+                if fstype == "vfat" && efi_dir.exists() && efi_dir.is_dir() {
                     return Some(mount_point.to_string());
                 }
             }
