@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug)]
 pub enum EfiError {
@@ -39,10 +40,22 @@ fn find_mounted_efi() -> Option<String> {
     {
         for mount_point in EFI_MOUNT_POINTS {
             let path = Path::new(mount_point);
-            if path.exists() && path.is_dir() {
-                // Check if it's actually mounted and looks like EFI
+            if !(path.exists() && path.is_dir()) { continue; }
+
+            // findmnt for robustness, can check filesystem type
+            let check_mount = Command::new("findmnt")
+                .arg("-n")
+                .arg("-o")
+                .arg("FSTYPE")
+                .arg(mount_point)
+                .output();
+
+            if let Ok(output) = check_mount {
+                let fstype = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let efi_dir = path.join("EFI");
-                if efi_dir.exists() {
+
+                // Check if it's actually mounted and looks like EFI
+                if fstype == "vfat" && efi_dir.exists() && efi_dir.is_dir() {
                     return Some(mount_point.to_string());
                 }
             }
