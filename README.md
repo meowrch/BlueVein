@@ -129,16 +129,30 @@ sudo systemctl status bluevein
 > By default, BlueVein automatically detects the EFI partition. If you have multiple EFI partitions or a non-standard configuration, use the `BLUEVEIN_EFI_DEVICE` environment variable:
 > ```bash
 > # For systemd service (edit /etc/systemd/system/bluevein.service)
-> Environment="BLUEVEIN_EFI_DEVICE=/dev/nvme0n1p1"
+> Environment="BLUEVEIN_EFI_DEVICE=/dev/disk/by-uuid/XXXX-XXXX"
 >
 > # Or for manual launch
-> sudo BLUEVEIN_EFI_DEVICE=/dev/nvme0n1p1 bluevein
+> sudo BLUEVEIN_EFI_DEVICE=/dev/disk/by-uuid/XXXX-XXXX bluevein
 > ```
 >
-> **Device examples:**
-> - `/dev/nvme0n1p1` — NVMe SSD
-> - `/dev/sda1` — SATA disk
-> - `/dev/vda1` — Virtual machine
+> > [!WARNING]
+> > **Use stable device identifiers!** Paths like `/dev/nvme0n1p1` or `/dev/sda1` can change between reboots (especially in multiboot setups). Always use stable identifiers from `/dev/disk/by-*`:
+>
+> **How to find your EFI partition's stable path:**
+> ```bash
+> # Find EFI partition UUID
+> lsblk -f | grep vfat
+> 
+> # Then use one of these stable paths:
+> ls -l /dev/disk/by-uuid/      # Filesystem UUID (recommended)
+> ls -l /dev/disk/by-partuuid/  # Partition UUID
+> ls -l /dev/disk/by-id/        # Device ID
+> ```
+>
+> **Stable device examples:**
+> - `/dev/disk/by-uuid/A1B2-C3D4` — Filesystem UUID (recommended)
+> - `/dev/disk/by-partuuid/12345678-1234-...` — Partition UUID
+> - `/dev/disk/by-id/nvme-Samsung_SSD_...-part1` — Device ID
 
 ### Windows
 

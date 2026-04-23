@@ -129,16 +129,30 @@ sudo systemctl status bluevein
 > По умолчанию BlueVein автоматически определяет EFI-раздел. Если у вас несколько EFI-разделов или нестандартная конфигурация, используйте переменную окружения `BLUEVEIN_EFI_DEVICE`:
 > ```bash
 > # Для systemd-сервиса (отредактируйте /etc/systemd/system/bluevein.service)
-> Environment="BLUEVEIN_EFI_DEVICE=/dev/nvme0n1p1"
+> Environment="BLUEVEIN_EFI_DEVICE=/dev/disk/by-uuid/XXXX-XXXX"
 >
 > # Или для ручного запуска
-> sudo BLUEVEIN_EFI_DEVICE=/dev/nvme0n1p1 bluevein
+> sudo BLUEVEIN_EFI_DEVICE=/dev/disk/by-uuid/XXXX-XXXX bluevein
 > ```
 >
-> **Примеры устройств:**
-> - `/dev/nvme0n1p1` — NVMe SSD
-> - `/dev/sda1` — SATA диск
-> - `/dev/vda1` — Виртуальная машина
+> > [!WARNING]
+> > **Используйте стабильные идентификаторы устройств!** Пути типа `/dev/nvme0n1p1` или `/dev/sda1` могут меняться между перезагрузками (особенно в multiboot-конфигурациях). Всегда используйте стабильные идентификаторы из `/dev/disk/by-*`:
+>
+> **Как найти стабильный путь к вашему EFI-разделу:**
+> ```bash
+> # Найдите UUID EFI-раздела
+> lsblk -f | grep vfat
+> 
+> # Затем используйте один из стабильных путей:
+> ls -l /dev/disk/by-uuid/      # UUID файловой системы (рекомендуется)
+> ls -l /dev/disk/by-partuuid/  # UUID раздела
+> ls -l /dev/disk/by-id/        # ID устройства
+> ```
+>
+> **Примеры стабильных путей:**
+> - `/dev/disk/by-uuid/A1B2-C3D4` — UUID файловой системы (рекомендуется)
+> - `/dev/disk/by-partuuid/12345678-1234-...` — UUID раздела
+> - `/dev/disk/by-id/nvme-Samsung_SSD_...-part1` — ID устройства
 
 ### Windows
 
