@@ -135,8 +135,7 @@ sudo systemctl status bluevein
 > sudo BLUEVEIN_EFI_DEVICE=/dev/disk/by-uuid/XXXX-XXXX bluevein
 > ```
 >
-> > [!WARNING]
-> > **Use stable device identifiers!** Paths like `/dev/nvme0n1p1` or `/dev/sda1` can change between reboots (especially in multiboot setups). Always use stable identifiers from `/dev/disk/by-*`:
+> ⚠️ **Use stable device identifiers!** Paths like `/dev/nvme0n1p1` or `/dev/sda1` can change between reboots (especially in multiboot setups). Always use stable identifiers from `/dev/disk/by-*`.
 >
 > **How to find your EFI partition's stable path:**
 > ```bash
