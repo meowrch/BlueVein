@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "fat32-raw"
-version = "1.0.2"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aaf3584baf9f0b6ce70037248533ecf45832669517904c7017a1fb16127a1f1"
+checksum = "78daba3dccda6c41c3a7e971351d06cf636f8772cc17f9fc17b634bdef41515f"
 dependencies = [
  "anyhow",
  "glob",
