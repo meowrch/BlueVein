@@ -104,7 +104,41 @@ sudo systemctl enable --now bluevein
 sudo systemctl status bluevein
 ```
 
-#### Option 2: Manual build (any distribution)
+#### Option 2: NixOS module
+
+By Flake:
+```nix
+{
+  inputs.bluevein.url = "github:meowrch/BlueVein";
+
+  outputs = { self, nixpkgs, bluevein, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        bluevein.nixosModules.default
+        {
+          services.bluevein.enable = true;
+
+          # Optional: pin the EFI device with a stable path
+          services.bluevein.efiDevice = "/dev/disk/by-uuid/A1B2-C3D4";
+        }
+      ];
+    };
+  };
+}
+```
+
+Non-flake usage:
+```nix
+{
+  imports = [ /path/to/BlueVein/nix/module.nix ];
+
+  services.bluevein.enable = true;
+  # services.bluevein.efiDevice = "/dev/disk/by-uuid/A1B2-C3D4";
+}
+```
+
+#### Option 3: Manual build (any distribution)
 
 ```bash
 # 1. Clone and build
