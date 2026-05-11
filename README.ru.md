@@ -104,7 +104,48 @@ sudo systemctl enable --now bluevein
 sudo systemctl status bluevein
 ```
 
-#### Вариант 2: Ручная сборка (любой дистрибутив)
+#### Вариант 2: Модуль NixOS
+
+С использованием Flake:
+
+```nix
+{
+  inputs.bluevein.url = "github:meowrch/BlueVein";
+
+  outputs = { self, nixpkgs, bluevein, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        bluevein.nixosModules.default
+        {
+          services.bluevein.enable = true;
+
+          # Опционально: зафиксировать EFI-устройство стабильным путем
+          services.bluevein.efiDevice = "/dev/disk/by-uuid/A1B2-C3D4";
+        }
+      ];
+    };
+  };
+}
+```
+
+```bash
+# Применить конфигурацию NixOS
+sudo nixos-rebuild switch --flake .#my-host
+```
+
+Без использования Flake:
+
+```nix
+{
+  imports = [ /path/to/BlueVein/nix/module.nix ];
+
+  services.bluevein.enable = true;
+  # services.bluevein.efiDevice = "/dev/disk/by-uuid/A1B2-C3D4";
+}
+```
+
+#### Вариант 3: Ручная сборка (любой дистрибутив)
 
 ```bash
 # 1. Клонируем и собираем
