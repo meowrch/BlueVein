@@ -248,7 +248,7 @@ Get-Service BlueVeinService
 >
 > **Как найти своё EFI-устройство:**
 > ```powershell
-> # List all partitions and find EFI
+> # Вывести список всех разделов и найти EFI
 > Get-Partition | Where-Object {$_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'} | Get-Volume | Select-Object DriveLetter, FileSystemLabel, FileSystemType, DriveType, HealthStatus, OperationalStatus, SizeRemaining, Size, UniqueId
 > # or simply: mountvol
 > ```
