@@ -227,24 +227,23 @@ Get-Service BlueVeinService
 > By default, BlueVein automatically detects the EFI partition. To specify a particular device, use the `BLUEVEIN_EFI_DEVICE` environment variable:
 > ```powershell
 > # For manual launch
-> $env:BLUEVEIN_EFI_DEVICE="\\.\PhysicalDrive0"
+> $env:BLUEVEIN_EFI_DEVICE="\\?\Volume{GUID}\"
 > .\bluevein.exe
 >
 > # To set machine-wide environment variable for the service
-> [System.Environment]::SetEnvironmentVariable('BLUEVEIN_EFI_DEVICE', '\\.\PhysicalDrive0', 'Machine')
+> [System.Environment]::SetEnvironmentVariable('BLUEVEIN_EFI_DEVICE', '\\?\Volume{GUID}\', 'Machine')
 > .\bluevein.exe install
 > .\bluevein.exe start
 > ```
 >
 > **Windows device format:**
-> - `\\.\PhysicalDrive0` — Physical disk (most common)
-> - `\\.\Harddisk0Partition1` — Specific partition
 > - `\\?\Volume{GUID}\` — Volume GUID path
 >
 > **How to find your EFI device:**
 > ```powershell
 > # List all partitions and find EFI
-> Get-Partition | Where-Object {$_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'}
+> Get-Partition | Where-Object {$_.GptType -eq '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'} | Get-Volume | Select-Object DriveLetter, FileSystemLabel, FileSystemType, DriveType, HealthStatus, OperationalStatus, SizeRemaining, Size, UniqueId
+> # or simply: mountvol
 > ```
 
 ## ⌨️ Service Management
