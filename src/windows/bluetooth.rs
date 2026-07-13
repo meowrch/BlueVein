@@ -10,7 +10,7 @@ use winreg::enums::*;
 use winreg::RegKey;
 
 const BLUETOOTH_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys";
-const BLUETOOTH_LE_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHLE\Parameters\Keys";
+const BLUETOOTH_LE_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys";
 
 pub struct WindowsBluetoothManager {
     hklm: RegKey,
