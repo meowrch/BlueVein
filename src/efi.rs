@@ -112,6 +112,36 @@ fn find_mounted_efi() -> Option<String> {
     None
 }
 
+fn find_json_end(data: &[u8]) -> usize {
+    let (mut depth, mut in_str, mut esc) = (0u32, false, false);
+    for (i, &b) in data.iter().enumerate() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        if in_str {
+            match b {
+                b'"' => in_str = false,
+                b'\\' => esc = true,
+                _ => {}
+            }
+        } else {
+            match b {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                b'"' => in_str = true,
+                _ => {}
+            }
+        }
+    }
+    data.len()
+}
+
 /// Read BlueVein configuration from EFI partition using default device
 #[allow(dead_code)]
 pub fn read_config() -> Result<BlueVeinConfig, EfiError> {
@@ -161,7 +191,12 @@ pub fn read_config_with_device(device: Option<&str>) -> Result<BlueVeinConfig, E
     .ok_or_else(|| EfiError::ReadError("ESP partition not found".to_string()))?;
 
     match volume.read_file(CONFIG_FILENAME) {
-        Ok(Some(data)) => {
+        Ok(Some(mut data)) => {
+            let end = find_json_end(&data);
+            if end < data.len() {
+                log!("[BlueVein] Truncated {} trailing bytes from config", data.len() - end);
+                data.truncate(end);
+            }
             let json_str = String::from_utf8(data).map_err(|e| {
                 EfiError::ParseError(format!("Invalid UTF-8 in config file: {}", e))
             })?;
