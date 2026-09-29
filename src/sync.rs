@@ -35,6 +35,11 @@ pub struct SyncManager {
 }
 
 impl SyncManager {
+    #[cfg(test)]
+    pub(crate) fn with_test_store(bt_manager: Box<dyn BluetoothManager>, store: Box<dyn ConfigStore>) -> Self {
+        Self { bt_manager, store }
+    }
+
     /// Create a new sync manager
     pub fn new(bt_manager: Box<dyn BluetoothManager>, efi_context: EfiContext) -> Self {
         Self {

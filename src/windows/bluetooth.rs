@@ -977,6 +977,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn automatic_startup_and_monitor_export_repaired_bond_without_manual_repair() {
+        use crate::{config::BlueVeinConfig, efi::{ConfigStore, EfiError}, sync::SyncManager};
+        use std::sync::{Arc, Mutex};
+        struct Store(Arc<Mutex<(BlueVeinConfig, usize)>>);
+        impl ConfigStore for Store {
+            fn read(&self) -> Result<BlueVeinConfig, EfiError> { Ok(self.0.lock().unwrap().0.clone()) }
+            fn write(&mut self, config: &BlueVeinConfig) -> Result<(), EfiError> {
+                let mut state = self.0.lock().unwrap(); state.0 = config.clone(); state.1 += 1; Ok(())
+            }
+            fn display_name(&self) -> &str { "test memory" }
+        }
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { TEST_PRESENT_LE.with(|v| *v.borrow_mut() = None); } }
+        TEST_PRESENT_LE.with(|v| *v.borrow_mut() = Some(vec!["412233445566".into()]));
+        let _reset = Reset;
+        let (hkcu, root, manager) = identity_fixture("automatic-repair");
+        let keys = manager.open_bluetooth_keys().unwrap();
+        let adapter = keys.open_subkey_with_flags("001122334455", KEY_ALL_ACCESS).unwrap();
+        let alias = adapter.open_subkey_with_flags("412233445566", KEY_ALL_ACCESS).unwrap();
+        let shadow = adapter.open_subkey_with_flags("123456789abc", KEY_ALL_ACCESS).unwrap();
+        shadow.set_raw_value("LTK", &winreg::RegValue { bytes: vec![0x99; 16], vtype: RegType::REG_BINARY }).unwrap();
+        let live = manager.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        let mut old = live.clone();
+        old.le.as_mut().unwrap().ltk.as_mut().unwrap().key = "99".repeat(16);
+        old.le.as_mut().unwrap().irk = Some("99".repeat(16));
+        old.le.as_mut().unwrap().peripheral_ltk = old.le.as_ref().unwrap().ltk.clone();
+        let mut shared = BlueVeinConfig::new(); shared.update_device("00:11:22:33:44:55".into(), old);
+        let state = Arc::new(Mutex::new((shared, 0)));
+        let mut sync = SyncManager::with_test_store(Box::new(manager), Box::new(Store(state.clone())));
+        // This is the normal service startup path, not repair-efi-only.
+        sync.sync_bidirectional().unwrap();
+        assert_eq!(state.lock().unwrap().0.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap().le.as_ref().unwrap().ltk, live.le.as_ref().unwrap().ltk);
+        let before = sync.local_snapshot().unwrap();
+        // Simulate another Windows re-pair while the service is running.
+        alias.set_raw_value("LTK", &winreg::RegValue { bytes: vec![0x55; 16], vtype: RegType::REG_BINARY }).unwrap();
+        alias.set_raw_value("IRK", &winreg::RegValue { bytes: vec![0x66; 16], vtype: RegType::REG_BINARY }).unwrap();
+        let current = sync.local_snapshot().unwrap();
+        let changes = super::super::monitor::changed_devices(&before, &current);
+        assert_eq!(changes.len(), 1);
+        for (adapter, peer) in changes { sync.handle_device_change(&adapter, &peer).unwrap(); }
+        let writes = state.lock().unwrap().1;
+        for _ in 0..3 { sync.check_efi_changes().unwrap(); }
+        assert_eq!(sync.local_snapshot().unwrap(), current);
+        let stored = state.lock().unwrap();
+        let le = stored.0.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap().le.as_ref().unwrap();
+        assert_eq!(le.ltk.as_ref().unwrap().key, "55".repeat(16));
+        assert_eq!(le.irk, Some("66".repeat(16)));
+        assert_eq!(le.peripheral_ltk, le.ltk);
+        assert_eq!(stored.1, writes);
+        assert_eq!(shadow.get_raw_value("LTK").unwrap().bytes, vec![0x99; 16]);
+        drop(stored); drop(sync); hkcu.delete_subkey_all(root).unwrap();
+    }
+
+    #[test]
     fn re_pair_migrates_only_efi_shadow_without_changing_windows_keys() {
         struct Reset;
         impl Drop for Reset { fn drop(&mut self) { TEST_PRESENT_LE.with(|v| *v.borrow_mut() = None); } }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 type Snapshot = HashMap<(String, String), BluetoothDevice>;
 
-fn changed_devices(old: &Snapshot, new: &Snapshot) -> Vec<(String, String)> {
+pub(super) fn changed_devices(old: &Snapshot, new: &Snapshot) -> Vec<(String, String)> {
     new.iter().filter(|(id, device)| old.get(*id) != Some(*device))
         .map(|(id, _)| id.clone()).collect()
 }
