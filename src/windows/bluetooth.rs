@@ -22,6 +22,51 @@ const PNP_ENUM_PATHS: [&str; 2] = [
 /// ERROR_NOT_FOUND: the Bluetooth stack has no device object for this address.
 const ERROR_NOT_FOUND: u32 = 1168;
 
+// Read only: enumerate present LE devnodes; never scan or connect a radio.
+#[link(name = "cfgmgr32")]
+extern "system" {
+    fn CM_Get_Device_ID_List_SizeW(len: *mut u32, filter: *const u16, flags: u32) -> u32;
+    fn CM_Get_Device_ID_ListW(filter: *const u16, buffer: *mut u16, len: u32, flags: u32) -> u32;
+}
+
+#[cfg(test)]
+thread_local! { static TEST_PRESENT_LE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) }; }
+
+fn present_le_storage_names() -> Result<Vec<String>, Box<dyn Error>> {
+    #[cfg(test)]
+    if let Some(names) = TEST_PRESENT_LE.with(|v| v.borrow().clone()) { return Ok(names); }
+
+    let filter: Vec<u16> = "BTHLE\0".encode_utf16().collect();
+    // CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT.
+    let flags = 0x00000101;
+    for _ in 0..3 {
+        let mut len = 0u32;
+        if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, filter.as_ptr(), flags) } != 0 {
+            return Err("Cannot enumerate present Bluetooth LE devices".into());
+        }
+        if len == 0 || len > 1_048_576 { return Err("Invalid Bluetooth device list size".into()); }
+        let mut buffer = vec![0u16; len as usize];
+        if unsafe { CM_Get_Device_ID_ListW(filter.as_ptr(), buffer.as_mut_ptr(), len, flags) } != 0 {
+            continue; // Device tree may change between size and list calls.
+        }
+        return Ok(buffer.split(|c| *c == 0).filter_map(|part| {
+            let id = String::from_utf16(part).ok()?.to_ascii_uppercase();
+            let mut parts = id.split('\\');
+            if parts.next()? != "BTHLE" { return None; }
+            let mac = parts.next()?.strip_prefix("DEV_")?;
+            if !is_valid_mac_hex(mac) || parts.next().is_none() { return None; }
+            Some(mac.to_string())
+        }).collect());
+    }
+    Err("Bluetooth device list changed during enumeration".into())
+}
+
+fn unique_present_storage(candidates: &[String], present: &[String]) -> Option<String> {
+    let mut matches = candidates.iter().filter(|name| present.iter().any(|p| p.eq_ignore_ascii_case(name)));
+    let first = matches.next()?.clone();
+    if matches.next().is_some() { None } else { Some(first) }
+}
+
 pub struct WindowsBluetoothManager {
     hklm: RegKey,
 }
@@ -181,7 +226,11 @@ impl WindowsBluetoothManager {
         }
         if let Some(first) = candidates.first() {
             if candidates.iter().any(|other| other.1 != first.1 || other.2 != first.2) {
-                return Err("Conflicting Windows LE records for one identity; refusing to choose a bond".into());
+                let names: Vec<_> = candidates.iter().map(|c| c.0.clone()).collect();
+                if let Some(selected) = unique_present_storage(&names, &present_le_storage_names()?) {
+                    return Ok(Some(selected));
+                }
+                return Err(format!("Conflicting Windows LE records for {}; no unique present LE device", identity).into());
             }
         }
         candidates.sort_by_key(|entry| entry.0.to_ascii_uppercase());
@@ -626,6 +675,43 @@ impl BluetoothManager for WindowsBluetoothManager {
 
     fn migrate_shared_config(&self, config: &mut crate::config::BlueVeinConfig) -> Result<(), Box<dyn Error>> {
         for adapter_mac in self.get_adapters()? {
+            let keys = self.open_bluetooth_keys()?;
+            let adapter = keys.open_subkey_with_flags(mac_to_windows_format(&adapter_mac), KEY_READ)?;
+            for local in self.get_devices(&adapter_mac)? {
+                let Some(shared) = config.get_device(&adapter_mac, &local.mac_address).cloned() else { continue; };
+                if shared.pending_deletion.is_some() { continue; }
+                let Some(selected) = Self::le_storage_name(&adapter, &local.mac_address)? else { continue; };
+                let names: Vec<_> = Self::le_locations(&adapter)?.into_iter()
+                    .filter(|(_, peer, _)| peer == &local.mac_address).map(|(name, _, _)| name).collect();
+                if names.len() < 2 { continue; }
+                let present = present_le_storage_names()?;
+                if unique_present_storage(&names, &present).as_deref() != Some(selected.as_str()) { continue; }
+                let (Some(live), Some(old)) = (&local.le, &shared.le) else { continue; };
+                let (Some(live_ltk), Some(old_ltk), Some(live_irk), Some(old_irk)) =
+                    (&live.ltk, &old.ltk, &live.irk, &old.irk) else { continue; };
+                if live_ltk.key.eq_ignore_ascii_case(&old_ltk.key) && live_irk.eq_ignore_ascii_case(old_irk) { continue; }
+                if old.irk_encoding.as_deref() != Some("windows") { continue; }
+                let mut verified_shadow = false;
+                for name in names.iter().filter(|name| *name != &selected) {
+                    let record = adapter.open_subkey_with_flags(name, KEY_READ)?;
+                    if let (Ok(ltk), Ok(irk)) = (record.get_raw_value("LTK"), record.get_raw_value("IRK")) {
+                        if hex::encode(&ltk.bytes).eq_ignore_ascii_case(&old_ltk.key)
+                            && hex::encode(&irk.bytes).eq_ignore_ascii_case(old_irk) {
+                            verified_shadow = true;
+                        }
+                    }
+                }
+                if verified_shadow {
+                    if old.peripheral_ltk.is_some() && !matches!(live_ltk.authenticated, Some(2) | Some(3)) {
+                        return Err("Cannot replace a legacy peripheral key after re-pairing".into());
+                    }
+                    let mut repaired = shared.clone();
+                    repaired.le = self.prepare_local_export(&local, &shared).le;
+                    repaired.name = self.choose_shared_name(&local, &shared);
+                    config.update_device(adapter_mac.clone(), repaired);
+                    log!("[BlueVein] Recovered re-paired LE identity {} from its unique present Windows device; EFI matched an inactive shadow", local.mac_address);
+                }
+            }
             // Registry reads establish the format of matching legacy IRKs.
             for local in self.get_devices(&adapter_mac)? {
                 if let Some(shared) = config.adapters.get_mut(&adapter_mac).and_then(|a| a.devices.get_mut(&local.mac_address)) {
@@ -885,6 +971,54 @@ fn registry_projection(device: &BluetoothDevice) -> BluetoothDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn re_pair_migrates_only_efi_shadow_without_changing_windows_keys() {
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { TEST_PRESENT_LE.with(|v| *v.borrow_mut() = None); } }
+        TEST_PRESENT_LE.with(|v| *v.borrow_mut() = Some(vec!["412233445566".into()]));
+        let _reset = Reset;
+        let (hkcu, root, manager) = identity_fixture("repaired-shadow");
+        let keys = manager.open_bluetooth_keys().unwrap();
+        let adapter = keys.open_subkey_with_flags("001122334455", KEY_ALL_ACCESS).unwrap();
+        let shadow = adapter.open_subkey_with_flags("123456789abc", KEY_ALL_ACCESS).unwrap();
+        shadow.set_raw_value("LTK", &winreg::RegValue { bytes: vec![0x99; 16], vtype: RegType::REG_BINARY }).unwrap();
+        let live = manager.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        let mut old = live.clone();
+        let le = old.le.as_mut().unwrap();
+        le.ltk.as_mut().unwrap().key = "99".repeat(16);
+        le.irk = Some("99".repeat(16));
+        le.peripheral_ltk = le.ltk.clone();
+        let mut config = crate::config::BlueVeinConfig::new();
+        config.update_device("00:11:22:33:44:55".into(), old);
+        manager.migrate_shared_config(&mut config).unwrap();
+        let repaired = config.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        assert_eq!(repaired.le.as_ref().unwrap().ltk, live.le.as_ref().unwrap().ltk);
+        assert_eq!(repaired.le.as_ref().unwrap().irk, live.le.as_ref().unwrap().irk);
+        assert_eq!(repaired.le.as_ref().unwrap().peripheral_ltk, live.le.as_ref().unwrap().ltk);
+        assert_eq!(shadow.get_raw_value("LTK").unwrap().bytes, vec![0x99; 16]);
+        assert_eq!(adapter.open_subkey("412233445566").unwrap().get_raw_value("LTK").unwrap().bytes, vec![0x11; 16]);
+        let once = config.clone();
+        manager.migrate_shared_config(&mut config).unwrap();
+        assert_eq!(config, once);
+        // An unrelated EFI bond must not be silently replaced.
+        config.adapters.get_mut("00:11:22:33:44:55").unwrap().devices.get_mut("12:34:56:78:9A:BC").unwrap().le.as_mut().unwrap().ltk.as_mut().unwrap().key = "77".repeat(16);
+        let unrelated = config.clone();
+        manager.migrate_shared_config(&mut config).unwrap();
+        assert_eq!(config, unrelated);
+        drop(manager);
+        hkcu.delete_subkey_all(root).unwrap();
+    }
+
+    #[test]
+    fn unique_present_le_record_resolves_shadow_but_not_two_live_bonds() {
+        let names = vec!["123456789ABC".into(), "412233445566".into()];
+        assert_eq!(unique_present_storage(&names, &["412233445566".into()]), Some("412233445566".into()));
+        assert_eq!(unique_present_storage(&names, &names), None);
+        assert_eq!(unique_present_storage(&names, &[]), None);
+        assert_eq!(unique_present_storage(&names, &["123456789abc".into()]), Some("123456789ABC".into()));
+        assert_eq!(unique_present_storage(&names, &["FFFFFFFFFFFF".into()]), None);
+    }
 
     #[test]
     fn cached_name_decodes_binary_utf8_and_registry_utf16() {

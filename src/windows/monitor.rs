@@ -24,11 +24,22 @@ pub fn monitor_bluetooth_changes(
     let mut previous = sync_manager.local_snapshot()?;
     let mut missing: HashMap<(String, String), (BluetoothDevice, Instant)> = HashMap::new();
     let mut last_import = Instant::now();
+    let mut snapshot_error: Option<(String, Instant)> = None;
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
         let current = match sync_manager.local_snapshot() {
-            Ok(state) => state,
-            Err(e) => { log!("[BlueVein] Local snapshot failed: {}", e); continue; }
+            Ok(state) => {
+                if snapshot_error.take().is_some() { log!("[BlueVein] Local snapshot recovered"); }
+                state
+            },
+            Err(e) => {
+                let message = e.to_string();
+                if snapshot_error.as_ref().map_or(true, |(old, since)| old != &message || since.elapsed() >= Duration::from_secs(60)) {
+                    log!("[BlueVein] Local snapshot failed (unchanged errors repeat at most once per minute): {}", message);
+                    snapshot_error = Some((message, Instant::now()));
+                }
+                continue;
+            }
         };
         let mut exported = true;
         for (adapter, device) in changed_devices(&previous, &current) {
