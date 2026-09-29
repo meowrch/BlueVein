@@ -232,3 +232,35 @@ Commit `3785471` passed 45 Windows tests and 30 Linux tests, with both release
 builds. It was deployed over the initial fix using the same backup, audit and
 registry-preservation checks. The maintainer confirmed cursor and keyboard input
 still work in Windows. Linux hardware and return-to-Windows checks remain pending.
+
+## Windows re-pair recovery (2026-09-29)
+
+A re-pair can leave two full BTHPORT LE records for one identity: a stale
+canonical record imported from EFI, and a working RPA-backed Windows device.
+The old monitor rejected every snapshot and logged the same error each second.
+
+The resolver now uses the Configuration Manager present BTHLE device list when
+full records conflict. Exactly one candidate must correspond to a present LE
+node; zero or multiple candidates still fail closed. This is device enumeration,
+not a radio scan, connection attempt or evidence of a currently encrypted link.
+
+Before startup import, EFI can be recovered from that local bond only when its
+Windows-encoded LTK and IRK match a rejected shadow record. Both represented
+local transports are retained, because re-pairing may renew Classic as well as
+LE. Secure Connections role keys are updated together; unresolved legacy role
+conflicts are refused. No registry record is deleted as part of this recovery.
+Unrelated EFI keys and pending deletion markers are not treated as stale bonds.
+
+Unchanged snapshot errors are logged at most once per minute, with a recovery
+message when snapshots succeed again. Tests cover unique/ambiguous enrollment,
+real isolated registry duplicates, dual-mode rekey, read-back convergence,
+idempotence, unrelated EFI conflicts and preservation of local key material.
+
+API reference: https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_device_id_lista
+
+Live Windows deployment of `3094977` passed read-only audit, EFI-only recovery,
+LTK/IRK/SC peripheral equality, full Windows key-registry preservation before and
+after service startup, and preservation of other EFI bonds. The first candidate
+was refused before writes because Classic had also changed; the final regression
+covers both transports. CI passed 65 Windows and 50 Linux tests with both builds.
+Cross-OS physical reconnect still needs testing when the host next boots Linux.
