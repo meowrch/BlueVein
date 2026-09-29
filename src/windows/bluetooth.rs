@@ -706,7 +706,11 @@ impl BluetoothManager for WindowsBluetoothManager {
                         return Err("Cannot replace a legacy peripheral key after re-pairing".into());
                     }
                     let mut repaired = shared.clone();
-                    repaired.le = self.prepare_local_export(&local, &shared).le;
+                    let exported = self.prepare_local_export(&local, &shared);
+                    repaired.le = exported.le;
+                    // A Windows re-pair can renew Classic and LE together.
+                    // Preserve its live Classic bond instead of importing stale EFI.
+                    if exported.classic.is_some() { repaired.classic = exported.classic; }
                     repaired.name = self.choose_shared_name(&local, &shared);
                     config.update_device(adapter_mac.clone(), repaired);
                     log!("[BlueVein] Recovered re-paired LE identity {} from its unique present Windows device; EFI matched an inactive shadow", local.mac_address);
@@ -983,8 +987,10 @@ mod tests {
         let adapter = keys.open_subkey_with_flags("001122334455", KEY_ALL_ACCESS).unwrap();
         let shadow = adapter.open_subkey_with_flags("123456789abc", KEY_ALL_ACCESS).unwrap();
         shadow.set_raw_value("LTK", &winreg::RegValue { bytes: vec![0x99; 16], vtype: RegType::REG_BINARY }).unwrap();
+        adapter.set_raw_value("123456789abc", &winreg::RegValue { bytes: vec![0x44; 16], vtype: RegType::REG_BINARY }).unwrap();
         let live = manager.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
         let mut old = live.clone();
+        old.classic.as_mut().unwrap().link_key = "77".repeat(16);
         let le = old.le.as_mut().unwrap();
         le.ltk.as_mut().unwrap().key = "99".repeat(16);
         le.irk = Some("99".repeat(16));
@@ -993,6 +999,9 @@ mod tests {
         config.update_device("00:11:22:33:44:55".into(), old);
         manager.migrate_shared_config(&mut config).unwrap();
         let repaired = config.get_device("00:11:22:33:44:55", "12:34:56:78:9A:BC").unwrap();
+        assert_eq!(repaired.classic, live.classic);
+        assert!(!manager.needs_update(&live, repaired));
+        assert_eq!(adapter.get_raw_value("123456789abc").unwrap().bytes, vec![0x44; 16]);
         assert_eq!(repaired.le.as_ref().unwrap().ltk, live.le.as_ref().unwrap().ltk);
         assert_eq!(repaired.le.as_ref().unwrap().irk, live.le.as_ref().unwrap().irk);
         assert_eq!(repaired.le.as_ref().unwrap().peripheral_ltk, live.le.as_ref().unwrap().ltk);
