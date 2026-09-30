@@ -8,8 +8,11 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BLUETOOTH_LIB_PATH: &str = "/var/lib/bluetooth";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct LinuxBluetoothManager { pending: bool }
 
@@ -497,7 +500,16 @@ impl LinuxBluetoothManager {
         // Publish a complete private record atomically; never expose partial keys.
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let temporary = device_dir.join(".bluevein-info.tmp");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = device_dir.join(format!(
+            ".bluevein-info.{}.{}.{}.tmp",
+            std::process::id(),
+            nonce,
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
         let published = (|| -> Result<(), Box<dyn Error>> {
             file.write_all(content.as_bytes())?;
@@ -708,6 +720,37 @@ mod general_import_tests {
             LinuxBluetoothManager::write_device_file(&path, &d).unwrap();
             assert!(fs::read_to_string(&path).unwrap().contains("Keep=value"));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_legacy_temporary_file_does_not_block_atomic_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "bluevein-stale-temp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("info");
+        fs::create_dir_all(&root).unwrap();
+        let stale = root.join(".bluevein-info.tmp");
+        fs::write(&stale, "orphaned partial data").unwrap();
+
+        let device = bond();
+        LinuxBluetoothManager::write_device_file(&path, &device).unwrap();
+
+        assert!(path.exists());
+        assert!(stale.exists());
+        assert_eq!(
+            LinuxBluetoothManager::parse_device_content(
+                &fs::read_to_string(&path).unwrap(),
+                &device.mac_address
+            )
+            .unwrap(),
+            device
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -295,6 +295,31 @@ mod name_tests {
         assert!(marker.comparable_with(&linux));
         assert!(!marker.matches_bond(&linux));
     }
+
+    #[test]
+    fn dual_mode_marker_rejects_either_transport_repair() {
+        let mut original = BluetoothDevice::le_with_ltk(
+            "AA:BB:CC:DD:EE:FF".into(),
+            LeLongTermKey {
+                key: "11".repeat(16),
+                authenticated: Some(2),
+                enc_size: Some(16),
+                ediv: Some(0),
+                rand: Some(0),
+            },
+        );
+        original.classic = Some(ClassicKeys::new("22".repeat(16)));
+        let marker = PendingDeletion::from_observed("windows", &original);
+        assert!(marker.matches_bond(&original));
+
+        let mut renewed_le = original.clone();
+        renewed_le.le.as_mut().unwrap().ltk.as_mut().unwrap().key = "33".repeat(16);
+        assert!(!marker.matches_bond(&renewed_le));
+
+        let mut renewed_classic = original;
+        renewed_classic.classic.as_mut().unwrap().link_key = "44".repeat(16);
+        assert!(!marker.matches_bond(&renewed_classic));
+    }
 }
 
 /// Validate Bluetooth key length

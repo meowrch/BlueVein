@@ -25,6 +25,7 @@ pub fn monitor_bluetooth_changes(
     let mut missing: HashMap<(String, String), (BluetoothDevice, Instant)> = HashMap::new();
     let mut last_import = Instant::now();
     let mut snapshot_error: Option<(String, Instant)> = None;
+    let mut refresh_after_import = false;
     while running.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
         let current = match sync_manager.local_snapshot() {
@@ -41,6 +42,14 @@ pub fn monitor_bluetooth_changes(
                 continue;
             }
         };
+        if refresh_after_import {
+            // An import may have changed or removed local records. When the
+            // immediate post-import read failed, the next healthy snapshot is
+            // a new baseline, not a set of locally initiated changes.
+            previous = current;
+            refresh_after_import = false;
+            continue;
+        }
         let mut exported = true;
         for (adapter, device) in changed_devices(&previous, &current) {
             if let Err(e) = sync_manager.handle_device_change(&adapter, &device) {
@@ -70,7 +79,25 @@ pub fn monitor_bluetooth_changes(
                 log!("[BlueVein] EFI import failed: {}", e);
             }
             // Imported writes must not be mistaken for new local pairings.
-            previous = sync_manager.local_snapshot()?;
+            refresh_after_import = true;
+            match sync_manager.local_snapshot() {
+                Ok(state) => {
+                    if snapshot_error.take().is_some() {
+                        log!("[BlueVein] Local snapshot recovered");
+                    }
+                    previous = state;
+                    refresh_after_import = false;
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    if snapshot_error.as_ref().map_or(true, |(old, since)| {
+                        old != &message || since.elapsed() >= Duration::from_secs(60)
+                    }) {
+                        log!("[BlueVein] Local snapshot failed after EFI import (unchanged errors repeat at most once per minute): {}", message);
+                        snapshot_error = Some((message, Instant::now()));
+                    }
+                }
+            }
             last_import = Instant::now();
         }
     }

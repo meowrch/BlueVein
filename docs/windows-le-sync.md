@@ -19,9 +19,11 @@ over the old marker; an uncomparable record or failed unpair leaves the marker
 for diagnosis. `audit-sync` previews the removal without changing either OS.
 
 Both OS binaries must be updated before relying on this protocol. An older
-binary can ignore the new marker. The automated tests cover the state machine,
-but physical unpair behavior on the dual-boot host is not yet verified; do not
-use a working InpuDeck/MX bond as the first live deletion test.
+binary accepts the unknown marker fields while reading JSON, but its next EFI
+write serializes the older schema and erases `name` and `pending_deletion`.
+The automated tests cover the state machine, but physical unpair behavior on
+the dual-boot host is not yet verified; do not use a working InpuDeck/MX bond
+as the first live deletion test.
 
 ### Removal failures observed on the dual-boot host (2026-09-21)
 
@@ -87,6 +89,13 @@ stop Bluetooth. Complete info files are published atomically with mode 0600;
 unrelated fields in existing records are retained. New imported bonds are trusted
 and declare their supported transports. No scanning or reconnect loop is added.
 
+Deletion requests are processed before an import batch because Linux removes a
+bond through the running BlueZ D-Bus service. Only after all eligible removals
+finish does BlueVein stop bluetoothd, publish key files, and start it once. Both
+services poll EFI every 30 seconds. The Linux monitor exports any pending local
+snapshot changes before each periodic import and recognizes BlueVein's atomic
+`info` rename, so an imported write is not reclassified as a new local pairing.
+
 `sudo bluevein --audit-sync` previews imports and migrations without writing keys
 or stopping Bluetooth. `sudo bluevein --sync-once` applies one batch. Normal service
 startup uses the same planner. Set `BLUEVEIN_EFI_DEVICE` as for the service.
@@ -133,7 +142,8 @@ and routes imports back to the real Windows storage entry.
   type. Requested MITM alone is not treated as proof of authentication. Windows
   writes use its boolean Authenticated representation and preserve other flags.
 - Missing metadata in older exports does not downgrade the same known LTK.
-- Complete Classic/LE snapshots serialize local exports before periodic imports.
+- Complete Classic/LE snapshots on both operating systems serialize local exports
+  before periodic imports.
 - Platform-only metadata does not cause endless import loops; unchanged state
   does not rewrite EFI. Read/import errors stop synchronization.
 - Windows service status interrogation no longer requests shutdown.

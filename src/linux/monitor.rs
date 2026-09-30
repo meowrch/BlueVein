@@ -1,6 +1,7 @@
 use crate::log;
 use crate::sync::SyncManager;
-use inotify::{Inotify, WatchMask};
+use futures::StreamExt;
+use inotify::{EventMask, EventOwned, Inotify, WatchDescriptor, WatchMask, Watches};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
@@ -8,15 +9,27 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const BLUETOOTH_LIB_PATH: &str = "/var/lib/bluetooth";
+const EFI_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const REMOVAL_SETTLE_TIME: Duration = Duration::from_secs(2);
+type Snapshot = HashMap<(String, String), crate::bluetooth::BluetoothDevice>;
+
+fn device_watch_mask() -> WatchMask {
+    WatchMask::MODIFY | WatchMask::CREATE | WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO
+}
+
+fn is_info_write(mask: EventMask) -> bool {
+    mask.intersects(EventMask::MODIFY | EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
+}
 
 pub async fn monitor_bluetooth_changes(
     mut sync_manager: SyncManager,
 ) -> Result<(), Box<dyn Error>> {
-    let mut inotify = Inotify::init()?;
+    let inotify = Inotify::init()?;
+    let mut watch_control = inotify.watches();
     let mut watches = HashMap::new();
 
     // Watch main bluetooth directory
-    let main_watch = inotify.watches().add(
+    let main_watch = watch_control.add(
         BLUETOOTH_LIB_PATH,
         WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_TO | WatchMask::MOVED_FROM,
     )?;
@@ -32,7 +45,7 @@ pub async fn monitor_bluetooth_changes(
                 // Check if it looks like an adapter (MAC address)
                 if name.contains(':') && name.len() == 17 {
                     // Watch adapter directory
-                    if let Ok(watch) = inotify.watches().add(
+                    if let Ok(watch) = watch_control.add(
                         &path,
                         WatchMask::CREATE
                             | WatchMask::DELETE
@@ -45,7 +58,7 @@ pub async fn monitor_bluetooth_changes(
                     }
 
                     // Watch device directories inside adapter
-                    add_device_watches(&mut inotify, &mut watches, &path);
+                    add_device_watches(&mut watch_control, &mut watches, &path);
                 }
             }
         }
@@ -60,120 +73,219 @@ pub async fn monitor_bluetooth_changes(
     // deletion marker. A record merely absent at boot is not evidence.
     let mut known = sync_manager.local_snapshot()?;
 
-    let mut buffer = [0; 4096];
+    let mut events = inotify.into_event_stream([0; 4096])?;
+    let mut poll = tokio::time::interval(EFI_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval` ticks immediately once; startup already performed a full sync.
+    poll.tick().await;
+    let mut refresh_after_import = false;
     loop {
-        let events = inotify.read_events_blocking(&mut buffer)?;
-
-        for event in events {
-            if let Some(name) = event.name {
-                let name_str = name.to_string_lossy().to_string();
-
-                // Get the base path for this watch (clone to avoid borrow issues)
-                let base_path = watches.get(&event.wd).cloned();
-
-                if let Some(base_path) = base_path {
-                    let full_path = base_path.join(&name_str);
-
-                    // Check if this is an adapter directory in main path
-                    if base_path.to_str() == Some(BLUETOOTH_LIB_PATH) {
-                        if name_str.contains(':') && name_str.len() == 17 {
-                            if event.mask.contains(inotify::EventMask::CREATE)
-                                || event.mask.contains(inotify::EventMask::MOVED_TO)
-                            {
-                                // New adapter detected, add watch
-                                if let Ok(watch) = inotify.watches().add(
-                                    &full_path,
-                                    WatchMask::CREATE
-                                        | WatchMask::DELETE
-                                        | WatchMask::MODIFY
-                                        | WatchMask::MOVED_TO
-                                        | WatchMask::MOVED_FROM,
-                                ) {
-                                    watches.insert(watch, full_path.clone());
-                                    log!("[BlueVein] New adapter detected: {}", name_str);
-
-                                    // Watch devices in new adapter
-                                    add_device_watches(&mut inotify, &mut watches, &full_path);
-                                }
-                            }
+        tokio::select! {
+            event = events.next() => {
+                let Some(event) = event else {
+                    return Err("Linux Bluetooth event stream ended".into());
+                };
+                if refresh_after_import {
+                    match sync_manager.local_snapshot() {
+                        Ok(snapshot) => {
+                            known = snapshot;
+                            refresh_after_import = false;
+                            log!("[BlueVein] Local snapshot recovered after EFI import");
                         }
-                    } else if name_str == "info" {
-                        // This is an info file change - extract device and adapter MAC
-                        if let Some(device_mac) = base_path.file_name().and_then(|n| n.to_str()) {
-                            if let Some(adapter_path) = base_path.parent() {
-                                if let Some(adapter_mac) =
-                                    adapter_path.file_name().and_then(|n| n.to_str())
-                                {
-                                    if event.mask.contains(inotify::EventMask::MODIFY)
-                                        || event.mask.contains(inotify::EventMask::CLOSE_WRITE)
-                                    {
-                                        log!("[BlueVein] Info file updated for device {} on adapter {}", device_mac, adapter_mac);
-
-                                        // Check if pairing keys (Classic or LE) exist now
-                                        if has_pairing_keys(&full_path) {
-                                            log!("[BlueVein] Pairing keys detected, syncing...");
-                                            if let Err(e) = sync_manager
-                                                .handle_device_change(adapter_mac, device_mac)
-                                            {
-                                                log!("[BlueVein] Failed to sync device: {}", e);
-                                            } else if let Ok(snapshot) = sync_manager.local_snapshot() {
-                                                if let Some(device) = snapshot.get(&(adapter_mac.to_string(), device_mac.to_string())) {
-                                                    known.insert((adapter_mac.to_string(), device_mac.to_string()), device.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        // This is a device change within an adapter directory
-                        if name_str.contains(':') && name_str.len() == 17 {
-                            let adapter_mac =
-                                base_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-                            if event.mask.contains(inotify::EventMask::DELETE)
-                                || event.mask.contains(inotify::EventMask::MOVED_FROM)
-                            {
-                                // Device removed
-                                log!(
-                                    "[BlueVein] Device removal detected: {} on adapter {}",
-                                    name_str,
-                                    adapter_mac
-                                );
-                                let id = (adapter_mac.to_string(), name_str.clone());
-                                if let Some(previous) = known.get(&id).cloned() {
-                                    tokio::time::sleep(Duration::from_secs(2)).await;
-                                    if !full_path.exists() {
-                                        match sync_manager.handle_device_removal(adapter_mac, &name_str, &previous) {
-                                            Ok(()) => { known.remove(&id); }
-                                            Err(e) => log!("[BlueVein] Failed to mark device removal: {}", e),
-                                        }
-                                    }
-                                }
-                            } else if event.mask.contains(inotify::EventMask::CREATE)
-                                || event.mask.contains(inotify::EventMask::MOVED_TO)
-                            {
-                                // New device directory created - add watch for info file
-                                log!(
-                                    "[BlueVein] New device directory detected: {} on adapter {}",
-                                    name_str,
-                                    adapter_mac
-                                );
-                                add_device_watches(&mut inotify, &mut watches, &base_path);
-                            }
+                        Err(e) => {
+                            log!("[BlueVein] Local snapshot still unavailable after EFI import: {}", e);
+                            continue;
                         }
                     }
                 }
+                handle_event(
+                    event?,
+                    &mut watch_control,
+                    &mut watches,
+                    &mut sync_manager,
+                    &mut known,
+                ).await;
+            }
+            _ = poll.tick() => {
+                poll_efi(&mut sync_manager, &mut known, &mut refresh_after_import).await;
             }
         }
     }
 }
 
+async fn poll_efi(
+    sync_manager: &mut SyncManager,
+    known: &mut Snapshot,
+    refresh_after_import: &mut bool,
+) {
+    if *refresh_after_import {
+        match sync_manager.local_snapshot() {
+            Ok(snapshot) => {
+                *known = snapshot;
+                *refresh_after_import = false;
+                log!("[BlueVein] Local snapshot recovered after EFI import");
+            }
+            Err(e) => {
+                log!("[BlueVein] Local snapshot still unavailable after EFI import: {}", e);
+                return;
+            }
+        }
+    }
+
+    let mut current = match sync_manager.local_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            log!("[BlueVein] Cannot poll EFI while the local snapshot is unavailable: {}", e);
+            return;
+        }
+    };
+
+    let missing: Vec<_> = known
+        .iter()
+        .filter(|(id, _)| !current.contains_key(*id))
+        .map(|(id, device)| (id.clone(), device.clone()))
+        .collect();
+    if !missing.is_empty() {
+        tokio::time::sleep(REMOVAL_SETTLE_TIME).await;
+        current = match sync_manager.local_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                log!("[BlueVein] Cannot confirm local removals before EFI import: {}", e);
+                return;
+            }
+        };
+        for ((adapter, mac), previous) in missing {
+            if current.contains_key(&(adapter.clone(), mac.clone())) {
+                continue;
+            }
+            if let Err(e) = sync_manager.handle_device_removal(&adapter, &mac, &previous) {
+                log!("[BlueVein] Failed to mark device removal before EFI import: {}", e);
+                return;
+            }
+        }
+    }
+
+    let changed: Vec<_> = current
+        .iter()
+        .filter(|(id, device)| known.get(*id) != Some(*device))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for (adapter, device) in changed {
+        if let Err(e) = sync_manager.handle_device_change(&adapter, &device) {
+            log!("[BlueVein] Local export failed; deferring EFI import: {}", e);
+            return;
+        }
+    }
+    *known = current;
+
+    if let Err(e) = sync_manager.check_efi_changes() {
+        log!("[BlueVein] Periodic EFI import failed: {}", e);
+    }
+    // Even a synchronization that reports unfinished removals can have changed
+    // local records. Never interpret those writes as fresh local pairings.
+    *refresh_after_import = true;
+    match sync_manager.local_snapshot() {
+        Ok(snapshot) => {
+            *known = snapshot;
+            *refresh_after_import = false;
+        }
+        Err(e) => log!("[BlueVein] Local snapshot failed after EFI import: {}", e),
+    }
+}
+
+async fn handle_event(
+    event: EventOwned,
+    watch_control: &mut Watches,
+    watches: &mut HashMap<WatchDescriptor, PathBuf>,
+    sync_manager: &mut SyncManager,
+    known: &mut Snapshot,
+) {
+    let Some(name) = event.name else { return; };
+    let name_str = name.to_string_lossy().to_string();
+    let Some(base_path) = watches.get(&event.wd).cloned() else { return; };
+    let full_path = base_path.join(&name_str);
+
+    if base_path.to_str() == Some(BLUETOOTH_LIB_PATH) {
+        if name_str.contains(':')
+            && name_str.len() == 17
+            && event.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
+        {
+            if let Ok(watch) = watch_control.add(
+                &full_path,
+                WatchMask::CREATE
+                    | WatchMask::DELETE
+                    | WatchMask::MODIFY
+                    | WatchMask::MOVED_TO
+                    | WatchMask::MOVED_FROM,
+            ) {
+                watches.insert(watch, full_path.clone());
+                log!("[BlueVein] New adapter detected: {}", name_str);
+                add_device_watches(watch_control, watches, &full_path);
+            }
+        }
+        return;
+    }
+
+    if name_str == "info" {
+        if !is_info_write(event.mask) { return; }
+        let Some(device_mac) = base_path.file_name().and_then(|n| n.to_str()) else { return; };
+        let Some(adapter_path) = base_path.parent() else { return; };
+        let Some(adapter_mac) = adapter_path.file_name().and_then(|n| n.to_str()) else { return; };
+        log!(
+            "[BlueVein] Info file updated for device {} on adapter {}",
+            device_mac,
+            adapter_mac
+        );
+        if has_pairing_keys(&full_path) {
+            log!("[BlueVein] Pairing keys detected, syncing...");
+            if let Err(e) = sync_manager.handle_device_change(adapter_mac, device_mac) {
+                log!("[BlueVein] Failed to sync device: {}", e);
+            } else if let Ok(snapshot) = sync_manager.local_snapshot() {
+                if let Some(device) = snapshot.get(&(adapter_mac.to_string(), device_mac.to_string())) {
+                    known.insert(
+                        (adapter_mac.to_string(), device_mac.to_string()),
+                        device.clone(),
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    if !name_str.contains(':') || name_str.len() != 17 { return; }
+    let adapter_mac = base_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if event.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
+        log!(
+            "[BlueVein] Device removal detected: {} on adapter {}",
+            name_str,
+            adapter_mac
+        );
+        let id = (adapter_mac.to_string(), name_str.clone());
+        if let Some(previous) = known.get(&id).cloned() {
+            tokio::time::sleep(REMOVAL_SETTLE_TIME).await;
+            if !full_path.exists() {
+                match sync_manager.handle_device_removal(adapter_mac, &name_str, &previous) {
+                    Ok(()) => {
+                        known.remove(&id);
+                    }
+                    Err(e) => log!("[BlueVein] Failed to mark device removal: {}", e),
+                }
+            }
+        }
+    } else if event.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO) {
+        log!(
+            "[BlueVein] New device directory detected: {} on adapter {}",
+            name_str,
+            adapter_mac
+        );
+        add_device_watches(watch_control, watches, &base_path);
+    }
+}
+
 /// Add watches for device directories and their info files
 fn add_device_watches(
-    inotify: &mut Inotify,
-    watches: &mut HashMap<inotify::WatchDescriptor, PathBuf>,
+    watch_control: &mut Watches,
+    watches: &mut HashMap<WatchDescriptor, PathBuf>,
     adapter_path: &PathBuf,
 ) {
     if let Ok(entries) = fs::read_dir(adapter_path) {
@@ -185,10 +297,7 @@ fn add_device_watches(
                 // Check if it looks like a device (MAC address)
                 if device_name.contains(':') && device_name.len() == 17 {
                     // Watch device directory for info file changes
-                    if let Ok(watch) = inotify.watches().add(
-                        &device_path,
-                        WatchMask::MODIFY | WatchMask::CREATE | WatchMask::CLOSE_WRITE,
-                    ) {
+                    if let Ok(watch) = watch_control.add(&device_path, device_watch_mask()) {
                         watches.insert(watch, device_path);
                     }
                 }
@@ -236,4 +345,162 @@ fn has_pairing_keys(info_path: &PathBuf) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bluetooth::{BluetoothDevice, BluetoothManager, LeLongTermKey};
+    use crate::config::BlueVeinConfig;
+    use crate::efi::{ConfigStore, EfiError};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct State {
+        local: HashMap<String, BluetoothDevice>,
+        shared: BlueVeinConfig,
+        local_writes: usize,
+        shared_writes: usize,
+    }
+
+    struct Backend(Arc<Mutex<State>>);
+    impl BluetoothManager for Backend {
+        fn platform_id(&self) -> &'static str { "linux" }
+        fn import_missing_reason(&self, _: &BluetoothDevice) -> Option<String> { None }
+        fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> {
+            Ok(vec!["adapter".into()])
+        }
+        fn get_devices(&self, _: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
+            Ok(self.0.lock().unwrap().local.values().cloned().collect())
+        }
+        fn get_device(&self, _: &str, mac: &str) -> Result<BluetoothDevice, Box<dyn Error>> {
+            self.0
+                .lock()
+                .unwrap()
+                .local
+                .get(mac)
+                .cloned()
+                .ok_or_else(|| "missing test device".into())
+        }
+        fn set_device(&mut self, _: &str, device: &BluetoothDevice) -> Result<(), Box<dyn Error>> {
+            let mut state = self.0.lock().unwrap();
+            state.local.insert(device.mac_address.clone(), device.clone());
+            state.local_writes += 1;
+            Ok(())
+        }
+        fn remove_device(&mut self, _: &str, mac: &str) -> Result<(), Box<dyn Error>> {
+            self.0.lock().unwrap().local.remove(mac);
+            Ok(())
+        }
+    }
+
+    struct Store(Arc<Mutex<State>>);
+    impl ConfigStore for Store {
+        fn read(&self) -> Result<BlueVeinConfig, EfiError> {
+            Ok(self.0.lock().unwrap().shared.clone())
+        }
+        fn write(&mut self, config: &BlueVeinConfig) -> Result<(), EfiError> {
+            let mut state = self.0.lock().unwrap();
+            state.shared = config.clone();
+            state.shared_writes += 1;
+            Ok(())
+        }
+        fn display_name(&self) -> &str { "test memory" }
+    }
+
+    fn device(key: &str) -> BluetoothDevice {
+        BluetoothDevice::le_with_ltk(
+            "phone".into(),
+            LeLongTermKey {
+                key: key.repeat(16),
+                authenticated: Some(1),
+                enc_size: Some(16),
+                ediv: Some(0),
+                rand: Some(0),
+            },
+        )
+    }
+
+    fn manager(state: Arc<Mutex<State>>) -> SyncManager {
+        SyncManager::with_test_store(
+            Box::new(Backend(state.clone())),
+            Box::new(Store(state)),
+        )
+    }
+
+    #[test]
+    fn atomic_info_rename_is_watched_and_classified_as_a_write() {
+        let root = std::env::temp_dir().join(format!(
+            "bluevein-inotify-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut inotify = Inotify::init().unwrap();
+        inotify.watches().add(&root, device_watch_mask()).unwrap();
+        let temporary = root.join(".bluevein-info.test.tmp");
+        fs::write(&temporary, "[LongTermKey]\nKey=11111111111111111111111111111111\n")
+            .unwrap();
+        fs::rename(&temporary, root.join("info")).unwrap();
+
+        let mut buffer = [0; 4096];
+        let events: Vec<_> = inotify
+            .read_events_blocking(&mut buffer)
+            .unwrap()
+            .map(|event| (event.name.map(|name| name.to_os_string()), event.mask))
+            .collect();
+        assert!(events.iter().any(|(name, mask)| {
+            name.as_deref() == Some(std::ffi::OsStr::new("info"))
+                && mask.contains(EventMask::MOVED_TO)
+                && is_info_write(*mask)
+        }));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_poll_imports_shared_only_bond_without_inotify_activity() {
+        let state = Arc::new(Mutex::new(State::default()));
+        state
+            .lock()
+            .unwrap()
+            .shared
+            .update_device("adapter".into(), device("11"));
+        let mut sync = manager(state.clone());
+        let mut known = Snapshot::new();
+        let mut refresh = false;
+
+        poll_efi(&mut sync, &mut known, &mut refresh).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.local.get("phone"), Some(&device("11")));
+        assert_eq!(state.local_writes, 1);
+        assert!(known.contains_key(&("adapter".into(), "phone".into())));
+        assert!(!refresh);
+    }
+
+    #[tokio::test]
+    async fn periodic_poll_exports_local_rekey_before_importing_efi() {
+        let old = device("11");
+        let renewed = device("22");
+        let mut initial = State::default();
+        initial.local.insert("phone".into(), renewed.clone());
+        initial.shared.update_device("adapter".into(), old.clone());
+        let state = Arc::new(Mutex::new(initial));
+        let mut sync = manager(state.clone());
+        let mut known = Snapshot::from([(("adapter".into(), "phone".into()), old)]);
+        let mut refresh = false;
+
+        poll_efi(&mut sync, &mut known, &mut refresh).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.shared.get_device("adapter", "phone"), Some(&renewed));
+        assert_eq!(state.local.get("phone"), Some(&renewed));
+        assert_eq!(state.local_writes, 0);
+        assert_eq!(state.shared_writes, 1);
+    }
 }
