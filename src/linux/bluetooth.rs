@@ -70,6 +70,27 @@ impl LinuxBluetoothManager {
         Ok(Self { pending: false })
     }
 
+    fn start_bluetooth_service(context: &str) -> Result<(), Box<dyn Error>> {
+        let status = Command::new("systemctl")
+            .args(["start", "bluetooth"])
+            .status()
+            .map_err(|error| format!("{}: could not run systemctl: {}", context, error))?;
+        if !status.success() {
+            return Err(format!(
+                "{}: systemctl start bluetooth exited with {}",
+                context, status
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Recover from a previous process dying after it stopped bluetoothd for
+    /// an atomic import but before the in-memory batch could be activated.
+    pub fn ensure_bluetooth_running() -> Result<(), Box<dyn Error>> {
+        Self::start_bluetooth_service("Bluetooth startup reconciliation failed")
+    }
+
     fn get_adapter_info_path(adapter_mac: &str) -> PathBuf {
         PathBuf::from(BLUETOOTH_LIB_PATH).join(normalize_mac(adapter_mac))
     }
@@ -572,8 +593,7 @@ impl BluetoothManager for LinuxBluetoothManager {
 
     fn apply_pending(&mut self) -> Result<(), Box<dyn Error>> {
         if self.pending {
-            let status = Command::new("systemctl").args(["start", "bluetooth"]).status()?;
-            if !status.success() { return Err("Bluetooth batch activation failed".into()); }
+            Self::start_bluetooth_service("Bluetooth batch activation failed")?;
             self.pending = false;
         }
         Ok(())

@@ -9,6 +9,8 @@ use std::fs;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -151,7 +153,11 @@ fn write_mounted_config(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let directory = path.parent().ok_or_else(|| std::io::Error::other("No EFI directory"))?;
     for attempt in 0..100 {
         let temporary = directory.join(format!(".bluevein-{}-{attempt}.tmp", std::process::id()));
-        let file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary);
         let mut file = match file {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -361,4 +367,31 @@ impl ConfigStore for EfiContext {
         write_config_with_device(config, Some(&self.device))
     }
     fn display_name(&self) -> &str { EfiContext::display_name(self) }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mounted_config_is_published_with_private_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "bluevein-mounted-config-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(CONFIG_FILENAME);
+
+        write_mounted_config(&path, b"private test data").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"private test data");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

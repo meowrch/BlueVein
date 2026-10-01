@@ -21,6 +21,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if args.len() != 1 || !matches!(args[0].as_str(), "--audit-sync" | "--sync-once") {
             return Err("Usage: bluevein [--audit-sync|--sync-once]".into());
         }
+        if args[0] == "--sync-once" {
+            log!("[BlueVein] Reconciling the Bluetooth service before synchronization...");
+            bluetooth::LinuxBluetoothManager::ensure_bluetooth_running()?;
+        }
         let efi_context = EfiContext::from_env();
         efi_context.validate()?;
         let mut sync = SyncManager::new(Box::new(bluetooth::LinuxBluetoothManager::new()?), efi_context);
@@ -33,6 +37,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_service() -> Result<(), Box<dyn Error>> {
+    log!("[BlueVein] Reconciling the Bluetooth service before startup synchronization...");
+    bluetooth::LinuxBluetoothManager::ensure_bluetooth_running()?;
     let bt_manager = Box::new(bluetooth::LinuxBluetoothManager::new()?);
 
     let efi_context = EfiContext::from_env();

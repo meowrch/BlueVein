@@ -93,8 +93,12 @@ marker. A device missing on the first snapshot after boot does **not** imply
 deletion: older bonds from the other OS can still be imported. Failed or
 ambiguous unpair operations leave the marker in EFI for diagnosis; they are
 reported after the run instead of stopping the synchronization of every other
-device, and the next cycle retries them. When Windows reports that it has no
-paired device object for the address, BlueVein removes only the leftover
+device, and the next cycle retries them. A transport switch with no comparable
+key requires manual marker resolution. If EFI already contains a different bond
+generation when the local one is removed, the shared record is preserved and
+may be imported again rather than deleting an unverified bond. When Windows
+reports that it has no paired device object for the address, BlueVein removes
+only the leftover
 BTHPORT key material that would otherwise resurrect the bond. Install a
 version with this behavior on **both** operating systems before using deletion
 as a cross-OS cleanup mechanism.

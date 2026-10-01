@@ -5,7 +5,7 @@ use inotify::{EventMask, EventOwned, Inotify, WatchDescriptor, WatchMask, Watche
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const BLUETOOTH_LIB_PATH: &str = "/var/lib/bluetooth";
@@ -118,6 +118,31 @@ async fn poll_efi(
     known: &mut Snapshot,
     refresh_after_import: &mut bool,
 ) {
+    poll_efi_at(
+        sync_manager,
+        known,
+        refresh_after_import,
+        Path::new(BLUETOOTH_LIB_PATH),
+        REMOVAL_SETTLE_TIME,
+    )
+    .await;
+}
+
+fn path_is_absent(path: &Path) -> std::io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+async fn poll_efi_at(
+    sync_manager: &mut SyncManager,
+    known: &mut Snapshot,
+    refresh_after_import: &mut bool,
+    bluetooth_root: &Path,
+    removal_settle_time: Duration,
+) {
     if *refresh_after_import {
         match sync_manager.local_snapshot() {
             Ok(snapshot) => {
@@ -146,7 +171,7 @@ async fn poll_efi(
         .map(|(id, device)| (id.clone(), device.clone()))
         .collect();
     if !missing.is_empty() {
-        tokio::time::sleep(REMOVAL_SETTLE_TIME).await;
+        tokio::time::sleep(removal_settle_time).await;
         current = match sync_manager.local_snapshot() {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -157,6 +182,27 @@ async fn poll_efi(
         for ((adapter, mac), previous) in missing {
             if current.contains_key(&(adapter.clone(), mac.clone())) {
                 continue;
+            }
+            let device_directory = bluetooth_root.join(&adapter).join(&mac);
+            match path_is_absent(&device_directory) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log!(
+                        "[BlueVein] Bond {} on adapter {} is missing from the readable snapshot, but its BlueZ directory still exists; deferring removal and EFI import",
+                        mac,
+                        adapter
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log!(
+                        "[BlueVein] Cannot verify whether the BlueZ directory for {} on adapter {} still exists; deferring removal and EFI import: {}",
+                        mac,
+                        adapter,
+                        error
+                    );
+                    return;
+                }
             }
             if let Err(e) = sync_manager.handle_device_removal(&adapter, &mac, &previous) {
                 log!("[BlueVein] Failed to mark device removal before EFI import: {}", e);
@@ -263,13 +309,21 @@ async fn handle_event(
         let id = (adapter_mac.to_string(), name_str.clone());
         if let Some(previous) = known.get(&id).cloned() {
             tokio::time::sleep(REMOVAL_SETTLE_TIME).await;
-            if !full_path.exists() {
-                match sync_manager.handle_device_removal(adapter_mac, &name_str, &previous) {
-                    Ok(()) => {
-                        known.remove(&id);
+            match path_is_absent(&full_path) {
+                Ok(true) => {
+                    match sync_manager.handle_device_removal(adapter_mac, &name_str, &previous) {
+                        Ok(()) => {
+                            known.remove(&id);
+                        }
+                        Err(e) => log!("[BlueVein] Failed to mark device removal: {}", e),
                     }
-                    Err(e) => log!("[BlueVein] Failed to mark device removal: {}", e),
                 }
+                Ok(false) => {}
+                Err(error) => log!(
+                    "[BlueVein] Cannot verify device directory removal for {}: {}",
+                    name_str,
+                    error
+                ),
             }
         }
     } else if event.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO) {
@@ -502,5 +556,47 @@ mod tests {
         assert_eq!(state.local.get("phone"), Some(&renewed));
         assert_eq!(state.local_writes, 0);
         assert_eq!(state.shared_writes, 1);
+    }
+
+    #[tokio::test]
+    async fn periodic_poll_does_not_treat_an_unreadable_existing_directory_as_removed() {
+        let old = device("11");
+        let mut initial = State::default();
+        initial.shared.update_device("adapter".into(), old.clone());
+        let state = Arc::new(Mutex::new(initial));
+        let mut sync = manager(state.clone());
+        let mut known = Snapshot::from([(("adapter".into(), "phone".into()), old)]);
+        let mut refresh = false;
+        let root = std::env::temp_dir().join(format!(
+            "bluevein-unreadable-bond-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("adapter").join("phone")).unwrap();
+
+        poll_efi_at(
+            &mut sync,
+            &mut known,
+            &mut refresh,
+            &root,
+            Duration::ZERO,
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        assert!(state
+            .shared
+            .get_device("adapter", "phone")
+            .unwrap()
+            .pending_deletion
+            .is_none());
+        assert_eq!(state.shared_writes, 0);
+        assert_eq!(state.local_writes, 0);
+        assert!(known.contains_key(&("adapter".into(), "phone".into())));
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
     }
 }

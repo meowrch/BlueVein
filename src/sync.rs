@@ -185,10 +185,25 @@ impl SyncManager {
     pub fn sync_bidirectional(&mut self) -> Result<(), Box<dyn Error>> {
         let result = self.sync_bidirectional_mode(true, true);
         let applied = self.bt_manager.apply_pending();
-        // A hard failure outranks a removal that the next cycle can retry.
-        match result {
-            Err(e) if e.downcast_ref::<UnfinishedRemovals>().is_none() => Err(e),
-            result => applied.and(result),
+        if let Err(error) = &applied {
+            log!(
+                "[BlueVein] Failed to activate pending Bluetooth changes after synchronization: {}",
+                error
+            );
+        }
+        match (result, applied) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(format!(
+                "Failed to activate pending Bluetooth changes: {}",
+                error
+            )
+            .into()),
+            (Err(sync_error), Err(apply_error)) => Err(format!(
+                "Synchronization failed: {}; additionally failed to activate pending Bluetooth changes: {}",
+                sync_error, apply_error
+            )
+            .into()),
         }
     }
 
@@ -304,23 +319,34 @@ impl SyncManager {
                             // is reported after the run; unrelated work continues.
                             match self.bt_manager.remove_device(adapter_mac, device_mac) {
                                 Ok(()) => {
-                                    if self
-                                        .bt_manager
-                                        .get_devices(adapter_mac)?
-                                        .iter()
-                                        .any(|device| device.mac_address == *device_mac)
-                                    {
-                                        log!(
-                                            "[BlueVein] Local bond {} still exists after removal",
-                                            label
-                                        );
-                                        deferred.push(format!(
-                                            "Local bond {} still exists after removal",
-                                            label
-                                        ));
-                                    } else {
-                                        completed_deletions
-                                            .insert((adapter_mac.clone(), device_mac.clone()));
+                                    match self.bt_manager.get_devices(adapter_mac) {
+                                        Ok(devices) if devices.iter().any(|device| {
+                                            device.mac_address.eq_ignore_ascii_case(device_mac)
+                                        }) => {
+                                            log!(
+                                                "[BlueVein] Local bond {} still exists after removal",
+                                                label
+                                            );
+                                            deferred.push(format!(
+                                                "Local bond {} still exists after removal",
+                                                label
+                                            ));
+                                        }
+                                        Ok(_) => {
+                                            completed_deletions
+                                                .insert((adapter_mac.clone(), device_mac.clone()));
+                                        }
+                                        Err(error) => {
+                                            log!(
+                                                "[BlueVein] Could not verify removal of {}; deferring completion: {}",
+                                                label,
+                                                error
+                                            );
+                                            deferred.push(format!(
+                                                "Could not verify removal of {}: {}",
+                                                label, error
+                                            ));
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -377,7 +403,7 @@ impl SyncManager {
                                 match local_device {
                                     Some(local) if marker.matches_bond(local) => {}
                                     Some(_) => {
-                                        log!("[BlueVein] Bond {} cannot be compared with deletion marker; leaving both records untouched", label);
+                                        log!("[BlueVein] Bond {} uses different transports than its deletion marker; leaving both records untouched. Re-pair it on the marker's source OS, or back up bluevein.json and clear the stale marker after verifying the local bond", label);
                                     }
                                     None => {}
                                 }
@@ -664,7 +690,7 @@ impl SyncManager {
                 }
                 if !marker.comparable_with(&device) {
                     log!(
-                        "[BlueVein] Bond {} cannot be compared with deletion marker; leaving both records untouched",
+                        "[BlueVein] Bond {} uses different transports than its deletion marker; leaving both records untouched. Re-pair it on the marker's source OS, or back up bluevein.json and clear the stale marker after verifying the local bond",
                         label
                     );
                     return Ok(());
@@ -717,7 +743,14 @@ impl SyncManager {
         }
         let mut config = self.store.read()?;
         let Some(shared) = config.get_device(adapter_mac, device_mac) else { return Ok(()); };
-        if shared.pending_deletion.is_some() || !shared.same_bond_as(previous) {
+        if shared.pending_deletion.is_some() {
+            return Ok(());
+        }
+        if !shared.same_bond_as(previous) {
+            log!(
+                "[BlueVein] Not marking removal of {}: EFI contains a different bond generation. The shared bond is preserved and may be imported again; re-pair or export the intended bond before retrying",
+                describe(device_mac, [Some(shared), Some(previous)])
+            );
             return Ok(());
         }
         let mut marked = shared.clone();
@@ -758,6 +791,9 @@ mod tests {
         activations: usize,
         pending: bool,
         fail_local_write: bool,
+        fail_post_removal_read_once: bool,
+        fail_activation: bool,
+        fail_shared_write: bool,
         discard_shared_write: bool,
         fail_read_after_write: bool,
         fail_removal: bool,
@@ -776,8 +812,11 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             if state.pending {
                 state.activations += 1;
-                state.pending = false;
                 state.operations.push("apply".into());
+                if state.fail_activation {
+                    return Err("simulated Bluetooth activation failure".into());
+                }
+                state.pending = false;
             }
             Ok(())
         }
@@ -787,8 +826,12 @@ mod tests {
         }
         fn get_adapters(&self) -> Result<Vec<String>, Box<dyn Error>> { Ok(vec!["adapter".into()]) }
         fn get_devices(&self, _: &str) -> Result<Vec<BluetoothDevice>, Box<dyn Error>> {
-            let state = self.0.lock().unwrap();
+            let mut state = self.0.lock().unwrap();
             if state.fail_local_read { return Err("simulated unreadable registry".into()); }
+            if state.fail_post_removal_read_once && state.local_removals > 0 {
+                state.fail_post_removal_read_once = false;
+                return Err("simulated transient post-unpair read failure".into());
+            }
             Ok(state.local.values().cloned().collect())
         }
         fn get_device(&self, _: &str, mac: &str) -> Result<BluetoothDevice, Box<dyn Error>> {
@@ -826,6 +869,11 @@ mod tests {
         }
         fn write(&mut self, config: &BlueVeinConfig) -> Result<(), efi::EfiError> {
             let mut state = self.0.lock().unwrap();
+            if state.fail_shared_write {
+                return Err(efi::EfiError::WriteError(
+                    "simulated EFI write failure".into(),
+                ));
+            }
             if !state.discard_shared_write { state.shared = config.clone(); }
             state.shared_writes += 1;
             Ok(())
@@ -893,6 +941,47 @@ mod tests {
         // An unrelated new pairing is still exported instead of being lost.
         assert!(s.shared.get_device("adapter", "headphones").is_some());
         assert_eq!(s.shared_writes, 1);
+    }
+
+    #[test]
+    fn transient_read_after_unpair_defers_completion_without_aborting_the_batch() {
+        let old = device("11");
+        let mut shared = old.clone();
+        shared.pending_deletion = Some(PendingDeletion::from_observed("windows", &shared));
+        let (mut sync, state) = setup(old, shared);
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_post_removal_read_once = true;
+            let mut other = device("33");
+            other.mac_address = "headphones".into();
+            s.local.insert(other.mac_address.clone(), other);
+        }
+
+        let error = sync.sync_bidirectional().unwrap_err();
+        assert!(error.downcast_ref::<UnfinishedRemovals>().is_some());
+        let error = error.to_string();
+        assert!(error.contains("Could not verify removal"), "{error}");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.local_removals, 1);
+            assert!(!s.local.contains_key("phone"));
+            assert!(s
+                .shared
+                .get_device("adapter", "phone")
+                .unwrap()
+                .pending_deletion
+                .is_some());
+            assert!(s.shared.get_device("adapter", "headphones").is_some());
+            assert_eq!(s.shared_writes, 1);
+        }
+
+        sync.sync_bidirectional().unwrap();
+        assert!(state
+            .lock()
+            .unwrap()
+            .shared
+            .get_device("adapter", "phone")
+            .is_none());
     }
 
     #[test]
@@ -1189,6 +1278,30 @@ mod tests {
         assert_eq!(state.shared_writes, 0);
         assert_eq!(state.local_writes, 0);
         assert_eq!(state.local.get("phone"), Some(&device("11")));
+    }
+
+    #[test]
+    fn activation_failure_is_reported_alongside_the_original_sync_error() {
+        let (mut sync, state) = setup(device("11"), device("22"));
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_activation = true;
+            s.fail_shared_write = true;
+            let mut other = device("33");
+            other.mac_address = "headphones".into();
+            s.local.insert(other.mac_address.clone(), other);
+        }
+
+        let error = sync.sync_bidirectional().unwrap_err().to_string();
+        assert!(error.contains("simulated EFI write failure"), "{error}");
+        assert!(
+            error.contains("simulated Bluetooth activation failure"),
+            "{error}"
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.activations, 1);
+        assert!(state.pending);
+        assert!(state.operations.contains(&"apply".to_string()));
     }
 
     #[test]

@@ -5,7 +5,11 @@
 A local bond absent at startup is not treated as deleted. The live monitor must
 first have observed it after a successful synchronization, then observe its
 removal. Windows waits for three seconds of continuous absence; Linux confirms
-the device directory remains absent after two seconds. The EFI record keeps a
+the device directory remains absent after two seconds. If a known bond drops
+out of the readable Linux snapshot while its BlueZ directory still exists, or
+the directory state cannot be read, BlueVein defers both removal handling and
+the following EFI import. A transient `info` read failure is not deletion
+evidence. The EFI record keeps a
 pending-deletion marker with the source OS and SHA-256 fingerprints of the
 observed bonding keys; the fingerprints are never logged. The source OS does
 not reimport that record.
@@ -15,8 +19,18 @@ API only when its bonding keys match the marker. Linux asks BlueZ `RemoveDevice`
 over D-Bus; Windows calls `BluetoothRemoveDevice`. After confirming the local
 record is gone, BlueVein removes the EFI record. If the local record was already
 absent, it only clears EFI. A different complete bond at the same address wins
-over the old marker; an uncomparable record or failed unpair leaves the marker
-for diagnosis. `audit-sync` previews the removal without changing either OS.
+over the old marker when the records share a represented transport. A
+transport-switch record with no comparable Classic or LE key cannot prove that
+it replaced the marked bond, so both records are left untouched. Re-pair it on
+the marker's source OS, or back up `bluevein.json`, verify the current bond, and
+clear the stale marker manually. `audit-sync` previews the removal without
+changing either OS.
+
+If a local bond is removed after EFI has already advanced to a different bond
+generation at the same address, BlueVein does not publish a marker for the old
+keys. It preserves the newer shared record, logs that it may be imported again,
+and requires the intended bond to be paired or exported again. There is no
+persisted three-way history from which to infer the user's intent.
 
 Both OS binaries must be updated before relying on this protocol. An older
 binary accepts the unknown marker fields while reading JSON, but its next EFI
@@ -39,6 +53,11 @@ the merge is published, and the failures are reported once as `UnfinishedRemoval
 after the EFI write. Service startup continues into monitoring for that error
 only; any other startup failure still stops before the export monitor, so an
 incomplete import can never be mistaken for a clean state.
+
+The same deferred result is used when the OS unpair call succeeds but the
+immediate verification snapshot cannot be read. The next cycle confirms the
+absence and clears EFI; unrelated exports from the first cycle are still
+published.
 
 ## Device names
 
@@ -83,11 +102,16 @@ transient private addresses are not manufactured into bonds. A record containing
 only address metadata is not exported as a bond.
 
 Linux stops Bluetooth once before writing an import batch, then starts it once
-afterwards, including on an import error. This prevents a running bluetoothd from
-flushing stale records over imported keys. Unchanged synchronization does not
-stop Bluetooth. Complete info files are published atomically with mode 0600;
-unrelated fields in existing records are retained. New imported bonds are trusted
-and declare their supported transports. No scanning or reconnect loop is added.
+afterwards, including on an import error. The normal service and `--sync-once`
+also start Bluetooth before their first synchronization, recovering from a
+previous BlueVein process that died while bluetoothd was stopped. An activation
+failure is reported even when the same batch already has another error. This
+prevents a running bluetoothd from flushing stale records over imported keys.
+Unchanged synchronization does not stop Bluetooth. Complete info files and
+mounted-ESP temporary config files are created with mode 0600 and published
+atomically; unrelated fields in existing records are retained. New imported
+bonds are trusted and declare their supported transports. No scanning or
+reconnect loop is added.
 
 Deletion requests are processed before an import batch because Linux removes a
 bond through the running BlueZ D-Bus service. Only after all eligible removals
@@ -194,6 +218,12 @@ BlueVein manages keys, not controller connection flags or reconnect requests.
 Startup retains upstream EFI precedence for unrelated conflicting offline edits;
 there is no persisted three-way conflict history. This branch must not be described
 as resolving arbitrary simultaneous offline pairing changes.
+
+Deletion markers also remain intentionally fail-closed across a transport switch:
+a Classic-only marker cannot authenticate an LE-only replacement, or vice versa.
+Likewise, deleting an older local generation does not delete a different shared
+generation. These cases are logged with recovery guidance but are not repaired
+automatically.
 
 ## Deployed Windows validation (2026-09-20)
 
