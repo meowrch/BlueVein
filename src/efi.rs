@@ -5,6 +5,12 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -112,6 +118,72 @@ fn find_mounted_efi() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn mounted_efi_for_device(device: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(device) = device.filter(|value| !value.is_empty()) else {
+        return Ok(find_mounted_efi().map(Into::into));
+    };
+    let requested = fs::canonicalize(device)
+        .map_err(|error| format!("Cannot resolve EFI device {device}: {error}"))?;
+    let mounts = fs::read_to_string("/proc/self/mounts")
+        .map_err(|error| format!("Cannot inspect mounted filesystems: {error}"))?;
+    for line in mounts.lines() {
+        let mut columns = line.split_whitespace();
+        let (Some(source), Some(target), Some(fs_type)) =
+            (columns.next(), columns.next(), columns.next()) else { continue };
+        if fs::canonicalize(source).ok().as_deref() != Some(requested.as_path()) {
+            continue;
+        }
+        let mount = Path::new(target);
+        if fs_type != "vfat" || !mount.join("EFI").is_dir() {
+            return Err(format!("EFI device is mounted at {target} without a usable EFI directory"));
+        }
+        return Ok(Some(mount.to_path_buf()));
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mounted_efi_for_device(_device: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn write_mounted_config(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let directory = path.parent().ok_or_else(|| std::io::Error::other("No EFI directory"))?;
+    for attempt in 0..100 {
+        let temporary = directory.join(format!(".bluevein-{}-{attempt}.tmp", std::process::id()));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            file.write_all(data)?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)?;
+            let directory_handle = fs::File::open(directory)?;
+            directory_handle.sync_all()?;
+            // FAT metadata may still be delayed after fsync(file) and fsync(dir).
+            // Windows and the raw reader must see the same cluster chain now.
+            if unsafe { libc::syncfs(directory_handle.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        return result;
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "No free EFI temporary name"))
+}
+
 fn find_json_end(data: &[u8]) -> usize {
     let (mut depth, mut in_str, mut esc) = (0u32, false, false);
     for (i, &b) in data.iter().enumerate() {
@@ -154,28 +226,17 @@ pub fn read_config() -> Result<BlueVeinConfig, EfiError> {
 /// * `device` - If Some, use direct disk access with specified device
 ///              If None, try mounted EFI first, then fallback to default device
 pub fn read_config_with_device(device: Option<&str>) -> Result<BlueVeinConfig, EfiError> {
-    // If device is explicitly specified, skip mounted filesystem check
-    if device.is_none() {
-        // Try mounted filesystem first (faster and no cache issues)
-        if let Some(mount_point) = find_mounted_efi() {
-            let config_path = Path::new(&mount_point).join(CONFIG_FILENAME);
-
-            if config_path.exists() {
-                match fs::read_to_string(&config_path) {
-                    Ok(json_str) => {
-                        return BlueVeinConfig::from_json(&json_str)
-                            .map_err(|e| EfiError::ParseError(e.to_string()));
-                    }
-                    Err(e) => {
-                        log!("[BlueVein] Warning: Failed to read from mounted EFI ({}), trying direct access", e);
-                        // Fall through to fat32-raw
-                    }
-                }
-            } else {
-                // File doesn't exist
-                return Err(EfiError::NotFound);
-            }
-        }
+    // Reading a mounted FAT volume through its raw block device can see stale
+    // clusters after the kernel has updated its cached FAT and directory.
+    if let Some(mount_point) = mounted_efi_for_device(device).map_err(EfiError::ReadError)? {
+        let config_path = mount_point.join(CONFIG_FILENAME);
+        let json_str = match fs::read_to_string(&config_path) {
+            Ok(json_str) => json_str,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(EfiError::NotFound),
+            Err(error) => return Err(EfiError::ReadError(error.to_string())),
+        };
+        return BlueVeinConfig::from_json(&json_str)
+            .map_err(|error| EfiError::ParseError(error.to_string()));
     }
 
     // Use specified device or empty (will fail if not mounted and no device specified)
@@ -231,36 +292,15 @@ pub fn write_config_with_device(
         .to_json()
         .map_err(|e| EfiError::WriteError(format!("Failed to serialize config: {}", e)))?;
 
-    // If device is not explicitly specified, try mounted filesystem first
-    if device.is_none() {
-        if let Some(mount_point) = find_mounted_efi() {
-            let config_path = Path::new(&mount_point).join(CONFIG_FILENAME);
-
-            match fs::write(&config_path, &json) {
-                Ok(_) => {
-                    // Sync to ensure data is flushed to disk
-                    #[cfg(target_os = "linux")]
-                    {
-                        unsafe {
-                            libc::sync();
-                        }
-                    }
-
-                    log!(
-                        "[BlueVein] Wrote config via mounted filesystem: {}",
-                        config_path.display()
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    log!(
-                        "[BlueVein] Warning: Failed to write to mounted EFI ({}), trying direct access",
-                        e
-                    );
-                    // Fall through to fat32-raw
-                }
-            }
-        }
+    // An explicit device path must not force raw writes while Linux has the
+    // same filesystem mounted. Use a synced replacement through the mount.
+    if let Some(mount_point) = mounted_efi_for_device(device).map_err(EfiError::WriteError)? {
+        let config_path = mount_point.join(CONFIG_FILENAME);
+        #[cfg(target_os = "linux")]
+        write_mounted_config(&config_path, json.as_bytes())
+            .map_err(|error| EfiError::WriteError(error.to_string()))?;
+        log!("[BlueVein] Wrote config via mounted filesystem: {}", config_path.display());
+        return Ok(());
     }
 
     // Use specified device or empty (will fail if not mounted and no device specified)
@@ -310,4 +350,48 @@ pub fn write_config_with_device(
     }
 
     Ok(())
+}
+
+/// Injectable shared store: tests exercise synchronization without touching disks.
+pub trait ConfigStore: Send {
+    fn read(&self) -> Result<BlueVeinConfig, EfiError>;
+    fn write(&mut self, config: &BlueVeinConfig) -> Result<(), EfiError>;
+    fn display_name(&self) -> &str;
+}
+
+impl ConfigStore for EfiContext {
+    fn read(&self) -> Result<BlueVeinConfig, EfiError> {
+        read_config_with_device(Some(&self.device))
+    }
+    fn write(&mut self, config: &BlueVeinConfig) -> Result<(), EfiError> {
+        write_config_with_device(config, Some(&self.device))
+    }
+    fn display_name(&self) -> &str { EfiContext::display_name(self) }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mounted_config_is_published_with_private_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "bluevein-mounted-config-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(CONFIG_FILENAME);
+
+        write_mounted_config(&path, b"private test data").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"private test data");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

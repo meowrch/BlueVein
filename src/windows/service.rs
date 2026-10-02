@@ -33,15 +33,7 @@ fn service_main(arguments: Vec<OsString>) {
 fn run_service_impl(_arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
-    let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match control_event {
-            ServiceControl::Stop | ServiceControl::Interrogate => {
-                shutdown_tx.send(()).ok();
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
-        }
-    };
+    let event_handler = move |control_event| handle_control(control_event, &shutdown_tx);
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
@@ -194,4 +186,29 @@ pub fn stop_service() -> Result<(), Box<dyn Error>> {
 
     log!("[BlueVein] Service stopped successfully!");
     Ok(())
+}
+
+fn handle_control(control: ServiceControl, shutdown: &mpsc::Sender<()>) -> ServiceControlHandlerResult {
+    match control {
+        ServiceControl::Stop => {
+            shutdown.send(()).ok();
+            ServiceControlHandlerResult::NoError
+        }
+        // SCM status interrogation is not a request to stop the service.
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        _ => ServiceControlHandlerResult::NotImplemented,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn status_interrogation_does_not_stop_sync_worker() {
+        let (tx, rx) = mpsc::channel();
+        handle_control(ServiceControl::Interrogate, &tx);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        handle_control(ServiceControl::Stop, &tx);
+        assert!(rx.try_recv().is_ok());
+    }
 }

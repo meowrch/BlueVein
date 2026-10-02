@@ -68,6 +68,12 @@ impl BlueVeinConfig {
         self.get_adapter_devices(adapter_mac)
             .and_then(|devices| devices.get(device_mac))
     }
+
+    pub fn remove_device(&mut self, adapter_mac: &str, device_mac: &str) {
+        if let Some(adapter) = self.adapters.get_mut(adapter_mac) {
+            adapter.devices.remove(device_mac);
+        }
+    }
 }
 
 #[cfg(test)]

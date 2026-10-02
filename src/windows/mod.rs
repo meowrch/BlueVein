@@ -10,8 +10,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread;
-use std::time::Duration;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     // Check if running as service or standalone
@@ -23,6 +21,28 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         if args.len() > 1 {
             match args[1].as_str() {
+                "audit-sync" | "sync-once" | "repair-efi-only" => {
+                    if args.len() != 2 && args.len() != 4 {
+                        return Err("Usage: audit-sync|sync-once [adapter-mac identity-mac]".into());
+                    }
+                    if args.len() == 4 {
+                        for address in &args[2..4] {
+                            if !crate::bluetooth::is_valid_mac_hex(&crate::bluetooth::mac_to_windows_format(address)) {
+                                return Err("Invalid scoped Bluetooth address".into());
+                            }
+                        }
+                        std::env::set_var("BLUEVEIN_ADAPTER_FILTER", &args[2]);
+                        std::env::set_var("BLUEVEIN_DEVICE_FILTER", &args[3]);
+                    }
+                    let manager = Box::new(bluetooth::WindowsBluetoothManager::new()?);
+                    let context = EfiContext::from_env();
+                    let mut sync = SyncManager::new(manager, context);
+                    match args[1].as_str() {
+                        "audit-sync" => sync.preview_bidirectional(),
+                        "repair-efi-only" => sync.repair_efi_only(),
+                        _ => sync.sync_bidirectional(),
+                    }
+                },
                 "install" => service::install_service(),
                 "uninstall" => service::uninstall_service(),
                 "start" => service::start_service(),
@@ -30,6 +50,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 _ => {
                     log!("BlueVein - Bluetooth Synchronization Service");
                     log!("\nUsage:");
+                    log!("  bluevein.exe audit-sync - Preview synchronization without changing keys");
+                    log!("  bluevein.exe sync-once  - Synchronize once, then exit");
                     log!("  bluevein.exe install   - Install service");
                     log!("  bluevein.exe uninstall - Uninstall service");
                     log!("  bluevein.exe start     - Start service");
@@ -54,9 +76,11 @@ pub fn run_sync_loop() -> Result<(), Box<dyn Error>> {
     let mut sync_manager = SyncManager::new(bt_manager, efi_context);
 
     log!("[BlueVein] Performing initial bidirectional sync...");
+    // A bond that refused to unpair keeps its marker and is retried by the next
+    // cycle; every other startup failure still stops before monitoring.
     if let Err(e) = sync_manager.sync_bidirectional() {
-        log!("[BlueVein] Warning: Initial sync failed: {}", e);
-        log!("[BlueVein] Continuing with monitoring...");
+        if e.downcast_ref::<crate::sync::UnfinishedRemovals>().is_none() { return Err(e); }
+        log!("[BlueVein] Continuing after {}", e);
     }
 
     let running = Arc::new(AtomicBool::new(true));
@@ -69,47 +93,7 @@ pub fn run_sync_loop() -> Result<(), Box<dyn Error>> {
     })
     .ok();
 
-    // Start periodic EFI checker in background thread
-    let running_efi = running.clone();
-    thread::spawn(move || {
-        periodic_efi_check(running_efi);
-    });
-
     // Start monitoring with registry change notifications
     log!("[BlueVein] Starting registry monitoring...");
     monitor::monitor_bluetooth_changes(sync_manager, running)
-}
-
-/// Periodically check EFI for changes made by other OS
-fn periodic_efi_check(running: Arc<AtomicBool>) {
-    let bt_manager = match bluetooth::WindowsBluetoothManager::new() {
-        Ok(mgr) => mgr,
-        Err(e) => {
-            log!(
-                "[BlueVein] Failed to create BT manager for EFI checking: {}",
-                e
-            );
-            return;
-        }
-    };
-
-    let efi_context = EfiContext::from_env();
-    if let Err(e) = efi_context.validate() {
-        log!("[BlueVein] Invalid EFI device configuration: {}", e);
-        return;
-    }
-
-    let mut sync_manager = SyncManager::new(Box::new(bt_manager), efi_context);
-
-    while running.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(30)); // Check every 30 seconds
-
-        if !running.load(Ordering::Relaxed) {
-            break;
-        }
-
-        if let Err(e) = sync_manager.check_efi_changes() {
-            log!("[BlueVein] Error checking EFI changes: {}", e);
-        }
-    }
 }

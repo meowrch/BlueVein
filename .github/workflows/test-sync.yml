@@ -1,0 +1,30 @@
+name: Bluetooth sync regression tests
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bluevein-${{ runner.os }}
+          path: |
+            target/release/bluevein.exe
+            target/release/bluevein
+          if-no-files-found: error
